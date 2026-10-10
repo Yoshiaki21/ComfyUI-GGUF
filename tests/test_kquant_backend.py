@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import types
 import unittest
@@ -26,6 +27,7 @@ def load_runtime_modules():
         spec.loader.exec_module(module)
         loaded[module_name] = module
     loaded["backend"] = sys.modules[f"{package_name}.kquant_backend"]
+    loaded["profile"] = sys.modules[f"{package_name}.dequant_profile"]
     return loaded
 
 
@@ -57,6 +59,7 @@ class KQuantBackendTests(unittest.TestCase):
         cls.ops = modules["ops"]
         cls.quant_ops = modules["quant_ops"]
         cls.backend_module = modules["backend"]
+        cls.profile = modules["profile"]
 
     def tearDown(self):
         self.backend_module.register_kquant_backend(None)
@@ -184,6 +187,8 @@ class KQuantBackendTests(unittest.TestCase):
         self.assertEqual(backend.calls, [])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the bundled Triton backend")
+    # ROCm では同梱カーネルが既定で無効なため、数値検証のときだけ明示的に有効化する。
+    @mock.patch.dict("os.environ", {"COMFYUI_GGUF_KQUANT_TRITON_ROCM": "1"})
     def test_bundled_triton_backend_matches_reference(self):
         self.backend_module.register_kquant_backend(None)
         from dequant import dequantize
@@ -226,6 +231,88 @@ class KQuantBackendTests(unittest.TestCase):
                     input_tensor, reference_weight, bias
                 )
                 torch.testing.assert_close(output, reference, rtol=2e-3, atol=8)
+
+
+class DequantProfileTests(unittest.TestCase):
+    """COMFYUI_GGUF_DEQUANT_PROFILE の切り分け用計測が経路ごとに集計されること。"""
+
+    @classmethod
+    def setUpClass(cls):
+        modules = load_runtime_modules()
+        cls.ops = modules["ops"]
+        cls.backend_module = modules["backend"]
+        cls.profile = modules["profile"]
+
+    quantized_storage = staticmethod(KQuantBackendTests.quantized_storage)
+    static_linear = KQuantBackendTests.static_linear
+
+    def setUp(self):
+        self.profile._stats.clear()
+        patcher = mock.patch.object(self.profile, "ENABLED", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.profile._stats.clear)
+        self.addCleanup(self.backend_module.register_kquant_backend, None)
+
+    def recorded(self):
+        return {key: value[0] for key, value in self.profile._stats.items()}
+
+    def test_native_route_is_recorded(self):
+        self.backend_module.register_kquant_backend(FakeKQuantBackend())
+        linear, _ = self.static_linear(gguf.GGMLQuantizationType.Q4_K)
+        linear.forward_ggml_cast_weights(torch.ones((1, 256), dtype=torch.float32))
+        self.assertEqual(self.recorded(), {("native_kquant", "Q4_K", "cpu"): 1})
+
+    def test_declined_native_route_records_dequant_and_matmul(self):
+        backend = FakeKQuantBackend()
+        backend.supports = lambda **kwargs: False
+        self.backend_module.register_kquant_backend(backend)
+        linear, _ = self.static_linear(gguf.GGMLQuantizationType.Q6_K)
+        linear.forward_ggml_cast_weights(torch.ones((1, 256), dtype=torch.float32))
+        self.assertEqual(
+            self.recorded(),
+            {("dequant", "Q6_K", "cpu"): 1, ("matmul", "Q6_K", "cpu"): 1},
+        )
+        with self.assertLogs(level="INFO") as logs:
+            self.profile.report_now()
+        self.assertIn("dequant", logs.output[0])
+        self.assertEqual(self.profile._stats, {})
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and getattr(torch.version, "hip", None),
+        "ROCm GPU is required",
+    )
+    def test_rocm_q6k_linear_uses_dequantized_route(self):
+        # 実機（ROCm）で同梱 Triton カーネルを経由せず、展開→matmul 経路になること
+        from tests.test_kquant_dequant import random_blocks
+
+        self.backend_module.register_kquant_backend(None)
+        self.backend_module._backend_checked = False
+        qtype = gguf.GGMLQuantizationType.Q6_K
+        raw = torch.from_numpy(random_blocks(qtype, 64, 512, seed=7)).cuda()
+        weight = self.ops.GGMLTensor(
+            raw, tensor_type=qtype, tensor_shape=torch.Size((64, 512))
+        )
+        linear = self.ops.GGMLOps.Linear(512, 64, bias=False, dtype=torch.bfloat16)
+        linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+        input_tensor = torch.randn((2, 300, 512), device="cuda", dtype=torch.bfloat16)
+
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("COMFYUI_GGUF_KQUANT_TRITON_ROCM", None)
+            output = linear.forward_ggml_cast_weights(input_tensor)
+
+        from dequant import dequantize
+
+        # 精度そのものは test_kquant_dequant で検証済み。ここでは経路の確認のため bf16 の丸め幅で比較する
+        reference = torch.nn.functional.linear(
+            input_tensor.float(), dequantize(raw, qtype, (64, 512), dtype=torch.float32)
+        )
+        scale = reference.abs().max().item()
+        torch.testing.assert_close(output.float(), reference, rtol=0, atol=scale * 2e-2)
+        recorded = self.recorded()
+        self.assertNotIn(("native_kquant", "Q6_K", "cuda"), recorded)
+        self.assertEqual(recorded.get(("dequant", "Q6_K", "cuda")), 1)
+        self.assertEqual(recorded.get(("matmul", "Q6_K", "cuda")), 1)
 
 
 if __name__ == "__main__":
