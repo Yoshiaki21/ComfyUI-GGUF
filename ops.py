@@ -15,6 +15,7 @@ import comfy.model_management
 import comfy.quant_ops
 from .dequant import dequantize_tensor, is_quantized
 from .kquant_backend import SUPPORTED_K_QUANTS, try_kquant_linear
+from . import dequant_profile
 
 
 # ComfyUI and comfy_kitchen can be upgraded independently. Newer ComfyUI
@@ -466,7 +467,12 @@ class GGMLLayer(torch.nn.Module):
             patch_list += move_patch_to_device(patches, device)
 
         # dequantize tensor while patches load
-        weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
+        if dequant_profile.ENABLED and is_quantized(tensor):
+            # 切り分け用：展開処理の所要時間を計測（COMFYUI_GGUF_DEQUANT_PROFILE=1 のときのみ）
+            with dequant_profile.timed("dequant", tensor.tensor_type, tensor.device):
+                weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
+        else:
+            weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
 
         # prevent propagating custom tensor class
         if isinstance(weight, GGMLTensor):
@@ -558,17 +564,33 @@ class GGMLOps(comfy.ops.manual_cast):
                         ),
                         copy=False,
                     )
-                output = try_kquant_linear(
-                    input,
-                    weight.data,
-                    weight_qtype,
-                    getattr(weight, "tensor_shape", weight.shape),
-                    bias,
-                )
+                if dequant_profile.ENABLED:
+                    # 切り分け用：K系ネイティブカーネル経路の所要時間を計測
+                    with dequant_profile.timed("native_kquant", weight_qtype, device) as profile:
+                        output = try_kquant_linear(
+                            input,
+                            weight.data,
+                            weight_qtype,
+                            getattr(weight, "tensor_shape", weight.shape),
+                            bias,
+                        )
+                        profile["record"] = output is not None
+                else:
+                    output = try_kquant_linear(
+                        input,
+                        weight.data,
+                        weight_qtype,
+                        getattr(weight, "tensor_shape", weight.shape),
+                        bias,
+                    )
                 if output is not None:
                     return output
 
             weight, bias = self.cast_bias_weight(input)
+            if dequant_profile.ENABLED and weight_qtype is not None and is_quantized(self.weight):
+                # 切り分け用：展開後の matmul の所要時間を計測
+                with dequant_profile.timed("matmul", weight_qtype, input.device):
+                    return torch.nn.functional.linear(input, weight, bias)
             return torch.nn.functional.linear(input, weight, bias)
 
     class Conv2d(GGMLLayer, comfy.ops.manual_cast.Conv2d):

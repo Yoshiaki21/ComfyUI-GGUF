@@ -111,4 +111,11 @@ quantized Linear to produce per-layer wall-clock timings. This intentionally
 serializes work and is unsuitable for normal inference or comparative
 throughput benchmarks.
 
+`COMFYUI_GGUF_DEQUANT_PROFILE=1` separately aggregates standard GGML
+dequantization, the following matmul, and native K-quant kernel time per
+quantization type and device, then logs a summary every 30 seconds
+(`COMFYUI_GGUF_DEQUANT_PROFILE_INTERVAL` overrides the interval). It also
+synchronizes the GPU around each measured region, so it is for route
+diagnosis only, not for s/it comparisons.
+
 For fixed adapter combinations, developers should merge adapters statically during export. Running `tools/convert.py --lora path/to/adapter.safetensors` fuses the parameters prior to quantization. Using the **Targeted Quantization (GGUF)** node's `streamed` input flag reads, fuses, quantizes, and stages one tensor block at a time to aggressively minimize peak RAM consumption.

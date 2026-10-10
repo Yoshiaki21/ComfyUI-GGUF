@@ -21,6 +21,7 @@ except ImportError:
 
 from .dequant import TORCH_COMPATIBLE_QTYPES, dequantize_functions
 from .kquant_backend import try_kquant_linear
+from . import dequant_profile
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,16 @@ class GGMLLayout(QuantizedLayout):
 
     @classmethod
     def dequantize(cls, qdata, params):
+        if dequant_profile.ENABLED:
+            # 切り分け用：Dynamic VRAM 経路の展開時間を計測（COMFYUI_GGUF_DEQUANT_PROFILE=1 のときのみ）
+            qtype = gguf.GGMLQuantizationType(params.tensor_type)
+            if qtype not in TORCH_COMPATIBLE_QTYPES:
+                with dequant_profile.timed("dequant", qtype, qdata.device):
+                    return cls._dequantize(qdata, params)
+        return cls._dequantize(qdata, params)
+
+    @classmethod
+    def _dequantize(cls, qdata, params):
         qtype = gguf.GGMLQuantizationType(params.tensor_type)
         orig_shape = (
             tuple(reversed(params.orig_shape))
@@ -90,6 +101,18 @@ def _try_native_linear(input_tensor, weight, bias):
     if not _is_ggml_qtensor(weight) or weight._params.transposed:
         return None
     qtype = gguf.GGMLQuantizationType(weight._params.tensor_type)
+    if dequant_profile.ENABLED:
+        # 切り分け用：Dynamic VRAM 経路の K系ネイティブカーネルの所要時間を計測
+        with dequant_profile.timed("native_kquant", qtype, input_tensor.device) as profile:
+            output = try_kquant_linear(
+                input_tensor,
+                weight._qdata,
+                qtype,
+                _physical_weight_shape(weight),
+                bias,
+            )
+            profile["record"] = output is not None
+            return output
     return try_kquant_linear(
         input_tensor,
         weight._qdata,
