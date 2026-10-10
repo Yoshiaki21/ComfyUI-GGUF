@@ -184,6 +184,8 @@ class KQuantBackendTests(unittest.TestCase):
         self.assertEqual(backend.calls, [])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the bundled Triton backend")
+    # ROCm では同梱カーネルが既定で無効なため、数値検証のときだけ明示的に有効化する。
+    @mock.patch.dict("os.environ", {"COMFYUI_GGUF_KQUANT_TRITON_ROCM": "1"})
     def test_bundled_triton_backend_matches_reference(self):
         self.backend_module.register_kquant_backend(None)
         from dequant import dequantize

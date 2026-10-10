@@ -1,5 +1,8 @@
 """Triton fused matmul backend for standard GGML K quants."""
 
+import logging
+import os
+
 import torch
 
 try:
@@ -13,12 +16,37 @@ except ImportError:
 SUPPORTED = {"Q4_K", "Q5_K", "Q6_K"}
 _BLOCK_SIZE = 256
 _TYPE_SIZES = {"Q4_K": 144, "Q5_K": 176, "Q6_K": 210}
+# ROCm でこの Triton カーネルを使いたい場合だけ "1" を設定する（既定は無効）。
+_ROCM_OPT_IN_ENV = "COMFYUI_GGUF_KQUANT_TRITON_ROCM"
+_rocm_notice_logged = False
+
+
+def _rocm_allowed():
+    # ROCm 版 PyTorch でも device.type は "cuda" になるため、ここで AMD GPU を判別する。
+    # このカーネルはトークン方向 16 行ごとに同じ重みブロックを展開し直すため、
+    # 拡散モデル（数千トークン）では gfx1151 実測で Q6_K が 24.70 s/it となり、
+    # 「展開 → rocBLAS matmul」（leejet 版と同じ経路、6.35 s/it）より大幅に遅い。
+    # そのため ROCm では既定で無効にし、従来の展開経路へフォールバックさせる。
+    global _rocm_notice_logged
+    if getattr(torch.version, "hip", None) is None:
+        return True
+    if os.environ.get(_ROCM_OPT_IN_ENV, "").strip() == "1":
+        return True
+    if not _rocm_notice_logged:
+        _rocm_notice_logged = True
+        logging.info(
+            "ComfyUI-GGUF: bundled Triton K-quant kernel is disabled on ROCm; "
+            "using dequantized Linear path (set %s=1 to enable)",
+            _ROCM_OPT_IN_ENV,
+        )
+    return False
 
 
 def _supports(*, qtype, device, input_dtype, weight_shape, weight_dtype):
     return (
         triton is not None
         and device.type == "cuda"
+        and _rocm_allowed()
         and qtype in SUPPORTED
         and input_dtype in {torch.float16, torch.bfloat16, torch.float32}
         and len(weight_shape) == 2

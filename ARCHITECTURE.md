@@ -42,7 +42,11 @@ allocation on each forward. It supports FP16, BF16, and FP32 activations and
 rank-3 activation shapes after flattening the leading dimensions.
 
 The backend is loaded lazily so installations without Triton or CUDA continue
-to use the existing PyTorch dequantization path. Non-Linear operations,
+to use the existing PyTorch dequantization path. On ROCm builds of PyTorch
+(which also report the `cuda` device type) the bundled Triton kernel is
+disabled by default because it was measured much slower than dequantize plus
+rocBLAS for diffusion workloads; set `COMFYUI_GGUF_KQUANT_TRITON_ROCM=1` to opt
+in. Non-Linear operations,
 unsupported block alignment, active weight patches/LoRAs, and backend failures
 also use the reference path. `Q2_K`, `Q3_K`, `Q8_K`, IQ formats, and custom CR
 formats are intentionally outside this route.

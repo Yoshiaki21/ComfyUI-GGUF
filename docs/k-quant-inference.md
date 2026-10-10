@@ -86,7 +86,10 @@ calls also fall back to the existing dequantized operation.
 Set `COMFYUI_GGUF_KQUANT_BACKEND` to an importable Python module name to
 override the bundled backend. If it is unset, the integration first probes
 `comfyui_gguf_kquant` and then the bundled Triton backend. Triton and CUDA are
-optional; when they are unavailable the reference path remains active. A
+optional; when they are unavailable the reference path remains active. On
+ROCm builds of PyTorch the bundled Triton kernel declines every route unless
+`COMFYUI_GGUF_KQUANT_TRITON_ROCM=1` is set, so AMD GPUs use the dequantized
+Linear path by default. A
 backend module may expose itself (or `backend`) with:
 
 ```python
