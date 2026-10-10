@@ -159,3 +159,27 @@ Architecture-protected, convolution, small, and one-dimensional tensors retain
 higher precision. The local encoder is used even when the installed `gguf`
 Python package only supports reading K quants; output is still validated against
 the repository’s reference dequantizer.
+
+### K-quant inference on AMD ROCm
+
+ROCm builds of PyTorch report the `cuda` device type, so the bundled Triton
+K-quant Linear kernel was previously selected on AMD GPUs as well. For
+diffusion models it re-decodes every weight block for each small activation
+tile and was far slower than dequantizing once and running the matmul through
+rocBLAS. On ROCm the bundled kernel is now disabled by default and Q4_K, Q5_K,
+and Q6_K Linear layers use the dequantized path. NVIDIA CUDA behavior is
+unchanged.
+
+| Setting | Effect |
+| --- | --- |
+| `COMFYUI_GGUF_KQUANT_TRITON_ROCM=1` | Re-enable the bundled Triton K-quant kernel on ROCm. |
+| `COMFYUI_GGUF_DEQUANT_PROFILE=1` | Log per-qtype dequantize / matmul / native-kernel time every 30 s (`COMFYUI_GGUF_DEQUANT_PROFILE_INTERVAL` changes the interval). It synchronizes the GPU, so use it only to diagnose the route, not to compare speed. |
+
+When the fix is active, the log shows `bundled Triton K-quant kernel is
+disabled on ROCm; using dequantized Linear path` once.
+
+Single measurement, for reference only: Qwen Image 2.1 image editing, 50
+steps, Radeon 8060S (gfx1151), ROCm 10.0, PyTorch 2.13.0, ComfyUI 0.39.2.
+Q6_K went from 24.70 s/it to 5.26 s/it. Q8_0 does not use this path and ran at
+4.52 s/it, measured right after a ComfyUI restart. Results depend on hardware,
+workflow, and offload settings.
