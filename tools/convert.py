@@ -15,7 +15,11 @@ from tqdm import tqdm
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+comfy_root = os.path.dirname(os.path.dirname(repo_root))
+if os.path.isfile(os.path.join(comfy_root, "comfy", "sd.py")):
+    sys.path.insert(0, comfy_root)
+sys.path.insert(0, repo_root)
 from lora import (
     fuse_target_entries_into_tensor,
     fuse_targets_into_state_dict,
@@ -37,38 +41,90 @@ QWEN3VL_SOURCE_PREFIX = "model.language_model."
 QWEN3VL_VISUAL_PREFIX = "model.visual."
 QWEN3VL_TEXT_ONLY_METADATA = "comfy.gguf.qwen3vl.text_only"
 QWEN3VL_VARIANT_METADATA = "comfy.gguf.qwen3vl.variant"
+QWEN3VL_LANGUAGE_LAYERS = 36
 QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT = 398
 QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT = 315
 QWEN3VL_SOURCE_TENSOR_COUNT = 713
-QWEN3VL_LANGUAGE_SHAPES = {
-    f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (151936, 2560),
-    f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (2560,),
-}
-for _layer_index in range(36):
-    for _suffix, _shape in {
-        "input_layernorm.weight": (2560,),
-        "post_attention_layernorm.weight": (2560,),
-        "self_attn.k_norm.weight": (128,),
-        "self_attn.q_norm.weight": (128,),
-        "self_attn.k_proj.weight": (1024, 2560),
-        "self_attn.q_proj.weight": (4096, 2560),
-        "self_attn.v_proj.weight": (1024, 2560),
-        "self_attn.o_proj.weight": (2560, 4096),
-        "mlp.down_proj.weight": (2560, 9728),
-        "mlp.gate_proj.weight": (9728, 2560),
-        "mlp.up_proj.weight": (9728, 2560),
-    }.items():
-        QWEN3VL_LANGUAGE_SHAPES[
-            f"{QWEN3VL_SOURCE_PREFIX}layers.{_layer_index}.{_suffix}"
-        ] = _shape
-QWEN3VL_VISUAL_SIGNATURE_SHAPES = {
-    f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (1024, 3, 2, 16, 16),
-    f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (2304, 1024),
-    f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (3072, 1024),
-    f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (2560, 4096),
-    f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (4096,),
-    f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (2560, 4096),
-}
+QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT = 398
+QWEN3VL_8B_SOURCE_VISUAL_TENSOR_COUNT = 351
+QWEN3VL_8B_SOURCE_TENSOR_COUNT = 749
+
+
+def _qwen3vl_language_shapes(hidden_size, q_proj_size, kv_proj_size, mlp_size, vocab_size=151936):
+    """Language key/shape table; the key set is shared by every Qwen3-VL size."""
+    shapes = {
+        f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (vocab_size, hidden_size),
+        f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (hidden_size,),
+    }
+    for _layer_index in range(QWEN3VL_LANGUAGE_LAYERS):
+        for _suffix, _shape in {
+            "input_layernorm.weight": (hidden_size,),
+            "post_attention_layernorm.weight": (hidden_size,),
+            "self_attn.k_norm.weight": (128,),
+            "self_attn.q_norm.weight": (128,),
+            "self_attn.k_proj.weight": (kv_proj_size, hidden_size),
+            "self_attn.q_proj.weight": (q_proj_size, hidden_size),
+            "self_attn.v_proj.weight": (kv_proj_size, hidden_size),
+            "self_attn.o_proj.weight": (hidden_size, q_proj_size),
+            "mlp.down_proj.weight": (hidden_size, mlp_size),
+            "mlp.gate_proj.weight": (mlp_size, hidden_size),
+            "mlp.up_proj.weight": (mlp_size, hidden_size),
+        }.items():
+            shapes[
+                f"{QWEN3VL_SOURCE_PREFIX}layers.{_layer_index}.{_suffix}"
+            ] = _shape
+    return shapes
+
+
+def _qwen3vl_visual_shapes(visual_size, out_hidden_size):
+    """A few visual tensors that pin down which Qwen3-VL size the checkpoint is."""
+    merge_size = visual_size * 4  # spatial_merge_size=2
+    return {
+        f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (visual_size, 3, 2, 16, 16),
+        f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (2304, visual_size),
+        f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (visual_size * 3, visual_size),
+        f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (out_hidden_size, merge_size),
+        f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (merge_size,),
+        f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (out_hidden_size, merge_size),
+    }
+
+
+# Qwen3-VL 4B: language hidden 2560, visual hidden 1024 (24 blocks).
+QWEN3VL_LANGUAGE_SHAPES = _qwen3vl_language_shapes(2560, 4096, 1024, 9728)
+QWEN3VL_VISUAL_SIGNATURE_SHAPES = _qwen3vl_visual_shapes(1024, 2560)
+# Qwen3-VL 8B: same language key set, hidden 4096, visual hidden 1152 (27 blocks).
+QWEN3VL_8B_LANGUAGE_SHAPES = _qwen3vl_language_shapes(4096, 4096, 1024, 12288)
+QWEN3VL_8B_VISUAL_SIGNATURE_SHAPES = _qwen3vl_visual_shapes(1152, 4096)
+
+
+def qwen3vl_variant_specs():
+    """Validation tables per supported Qwen3-VL size.
+
+    Read from module globals at call time so that tests can patch the tables,
+    and so a future size only needs one more entry here.
+    """
+    return (
+        {
+            "variant": "4b",
+            "language_shapes": QWEN3VL_LANGUAGE_SHAPES,
+            "visual_shapes": QWEN3VL_VISUAL_SIGNATURE_SHAPES,
+            "counts": (
+                QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT,
+                QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT,
+                QWEN3VL_SOURCE_TENSOR_COUNT,
+            ),
+        },
+        {
+            "variant": "8b",
+            "language_shapes": QWEN3VL_8B_LANGUAGE_SHAPES,
+            "visual_shapes": QWEN3VL_8B_VISUAL_SIGNATURE_SHAPES,
+            "counts": (
+                QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT,
+                QWEN3VL_8B_SOURCE_VISUAL_TENSOR_COUNT,
+                QWEN3VL_8B_SOURCE_TENSOR_COUNT,
+            ),
+        },
+    )
 
 
 class SourceStateDict(OrderedDict):
@@ -85,7 +141,9 @@ class ModelTemplate:
     keys_banned = []  # list of keys that should mark model as invalid for conversion
     keys_hiprec = []  # list of keys that need to be kept in fp32 for some reason
     keys_noquant = [] # list of keys that must retain their source precision
+    keys_k_noquant = [] # tensors to keep at source precision for standard K-quants
     keys_q8_cr = [] # keys that use native INT8 ConvRot in a Q4_CR conversion
+    keys_q8_cr_l = [] # additional keys that use native INT8 ConvRot in a Q4_CR_L conversion
     keys_ignore = []  # list of strings to ignore keys by when found
 
     def handle_nd_tensor(self, key, data):
@@ -127,6 +185,38 @@ class ModelFlux(ModelTemplate):
         ("double_blocks.0.img_attn.proj.weight",),
     ]
     keys_banned = ["transformer_blocks.0.attn.norm_added_k.weight",]
+
+class ModelFlux3(ModelTemplate):
+    arch = "flux3"
+    keys_detect = [
+        (
+            "content_mode_blocks.image.0.attn_out.weight",
+            "content_mode_blocks.image_cond.0.attn_out.weight",
+            "single_stream_modulations.txt.lin.weight",
+        )
+    ]
+    # Keep final latent patch projection in F32 to avoid per-patch quantization grid artifacts.
+    keys_hiprec = ["^final_layer.image.linear."]
+    # Input patch projections have K=128 (below 256-value block size); retain source precision.
+    keys_noquant = ["^emb_in."]
+    keys_k_noquant = ["^emb_in."]
+    # Conditioning, shared AdaLN modulations, and early image attention output
+    # projections are highly sensitive to 4-bit error.
+    keys_q8_cr = [
+        "^time_in.",
+        "^ref_time_in.",
+        "^txt_in.",
+        "^final_layer.image.adaLN_modulation.",
+        "^early_stream_modulations.",
+        "^single_stream_modulations.",
+        "^content_mode_blocks.image.*.attn_out.*",
+    ]
+    # Q4_CR_L additionally promotes early dual-stream image V and text attention
+    # output projections to Q8_CR while keeping Flux3 Klein under 3 GB.
+    keys_q8_cr_l = [
+        "^content_mode_blocks.image.*.v_proj.*",
+        "^txt_mode_blocks.*.attn_out.*",
+    ]
 
 class ModelSD3(ModelTemplate):
     arch = "sd3"
@@ -347,13 +437,49 @@ class ModelMinimaxH3(ModelTemplate):
         "^final_layer.",
         "adaln_proj",
         "modulation",
-        "^blocks.*.attn.qkv_proj.",
-        "^blocks.*.attn.out_proj.",
-        "^blocks.*.mlp.fc2.",
+        "^blocks.*.attn.qkv_proj.*",
+        "^blocks.*.attn.out_proj.*",
+        "^blocks.*.mlp.fc2.*",
     ]
     # These paths are already BF16 in the reference checkpoint. Quantizing the
     # conditioning projection or token refiner to W4A4 costs quality while
     # saving little compared with the 50 main transformer blocks.
+    keys_noquant = [
+        "^condition_proj.",
+        "^token_refiner.",
+        "norm",
+    ]
+
+
+class ModelMinimaxH3Image(ModelMinimaxH3):
+    # Image-only H3 keeps the same 50-block DiT but drops the audio stream, so
+    # ComfyUI detects it as `minimax_h3_image` (comfy/model_detection.py).
+    arch = "minimax_h3_image"
+    keys_detect = [
+        (
+            "video_patch_proj.weight",
+            "condition_proj.weight",
+            "final_layer.video_out.weight",
+            "token_refiner.final_norm.weight",
+        )
+    ]
+    # The audio/video checkpoint must stay on `minimax_h3`; its extra stream
+    # would silently load as unexpected keys here.
+    keys_banned = ["audio_patch_proj.weight"]
+    # Only the tensors that leave the ordinary Linear paths stay FP32: the
+    # timestep curve table, the latent patch projection, the final
+    # output/adaLN projections, and per-block adaLN modulation. The 50 main
+    # transformer blocks are ordinary Linear weights and are quantized.
+    keys_hiprec = [
+        "adaln_t_table",
+        "^video_patch_proj.",
+        "^final_layer.",
+        "adaln_proj",
+        "modulation",
+    ]
+    # The conditioning projection and token refiner are BF16 in the reference
+    # export, and quantizing these small paths costs quality while saving
+    # little compared with the 50 main transformer blocks.
     keys_noquant = [
         "^condition_proj.",
         "^token_refiner.",
@@ -418,6 +544,8 @@ class ModelMiniMaxMusic3TextEncoder(ModelTemplate):
 
 class ModelQwen3VL(ModelTemplate):
     arch = "qwen3vl"
+    # Set from the detected checkpoint size by detect_arch(); see qwen3vl_variant_specs().
+    qwen3vl_variant = "4b"
     keys_detect = [
         (
             f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_proj.weight",
@@ -488,11 +616,58 @@ class ModelQwenImage21(ModelTemplate):
     ]
 
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
+class ModelMOSSImage(ModelTemplate):
+    arch = "moss_image"
+    keys_detect = [
+        (
+            "shared_block_modulation.weight",
+            "layers.0.proj.ffn_up_gate.weight",
+            "layers.0.proj.qkv.weight",
+            "video_embedder.weight",
+            "final_linear_video.weight",
+        )
+    ]
+    keys_noquant = [
+        "^text_embedder.",
+        "^time_embedding.",
+        "^shared_block_modulation.",
+        "^video_embedder.",
+        "^video_head_modulation.",
+        "^final_linear_video.",
+    ]
+    keys_q8_cr = [
+        "^layers.*.proj.qkv.weight",
+        "^layers.*.proj.o.weight",
+    ]
+    keys_ignore = ["^rope.bands"]
+
+
+class ModelFibo2(ModelTemplate):
+    arch = "fibo2"
+    keys_detect = [
+        (
+            "perceiver.latent_queries",
+            "layers.0.attention.qkv.weight",
+            "layers.0.feed_forward.w13.weight",
+            "final_layer.linear.weight",
+        )
+    ]
+    # These are learned queries rather than Linear weights, and Fibo's
+    # reference quantized export keeps AdaLN modulation projections in BF16.
+    keys_noquant = [
+        "^perceiver.latent_queries",
+        "adaLN_modulation",
+    ]
+    # The 128-wide input projection cannot be represented by 256-value K-quant
+    # rows; retain source precision for K quants while allowing other formats.
+    keys_k_noquant = ["^x_embedder.weight"]
+
+
+arch_list = [ModelFlux, ModelFlux3, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
-             ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
+             ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3Image, ModelMinimaxH3VAE,
              ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3, ModelQwen3VL,
-             ModelQwenImage21]
+             ModelQwenImage21, ModelMOSSImage, ModelFibo2]
 
 QWEN3_HF_KEY_MAP = {
     "embed_tokens.weight": "token_embd.weight",
@@ -530,46 +705,59 @@ def map_qwen3_state_dict(state_dict):
 
 
 def normalize_qwen3vl_state_dict(state_dict):
-    """Validate and extract the official BF16 Qwen3-VL 4B language encoder."""
+    """Validate an official BF16 Qwen3-VL checkpoint and extract its language encoder.
+
+    Returns the mapped language-only state dict carrying the detected size
+    variant, or None when the source is not a Qwen3-VL checkpoint at all.
+    """
     keys = set(state_dict)
     if not any(key.startswith(QWEN3VL_SOURCE_PREFIX) for key in keys):
         return None
     embedding_key = f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight"
-    layer_35_key = f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight"
+    layer_35_key = f"{QWEN3VL_SOURCE_PREFIX}layers.{QWEN3VL_LANGUAGE_LAYERS - 1}.self_attn.q_proj.weight"
     if embedding_key not in keys or layer_35_key not in keys:
         raise ValueError(
-            "Only the official Qwen3-VL 4B BF16 checkpoint is supported; "
+            "Only the official Qwen3-VL 4B or 8B BF16 checkpoint is supported; "
             "the language-model key layout is incompatible."
         )
     if not any(key.startswith(QWEN3VL_VISUAL_PREFIX) for key in keys):
         raise ValueError(
-            "Qwen3-VL 4B conversion requires the original checkpoint with both "
+            "Qwen3-VL conversion requires the original checkpoint with both "
             "language and visual tensors; text-only inputs are not a supported source."
         )
 
-    expected_shapes = QWEN3VL_LANGUAGE_SHAPES
+    specs = qwen3vl_variant_specs()
     language_keys = {
         key for key in keys if key.startswith(QWEN3VL_SOURCE_PREFIX)
     }
-    unexpected = sorted(language_keys - expected_shapes.keys())
-    missing = sorted(expected_shapes.keys() - language_keys)
     visual_keys = {key for key in keys if key.startswith(QWEN3VL_VISUAL_PREFIX)}
+    # Every supported Qwen3-VL size shares one language key set, so the key names
+    # are validated once; only shapes and tensor counts are per-size.
     unsupported_prefixes = sorted(
         key for key in keys
         if not key.startswith((QWEN3VL_SOURCE_PREFIX, QWEN3VL_VISUAL_PREFIX))
     )
-    expected_counts = (
-        QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT,
-        QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT,
-        QWEN3VL_SOURCE_TENSOR_COUNT,
-    )
     actual_counts = (len(language_keys), len(visual_keys), len(keys))
-    if unexpected or missing or unsupported_prefixes or actual_counts != expected_counts:
+    matches = [spec for spec in specs if spec["counts"] == actual_counts]
+    # Key names are validated against the size the tensor counts selected, and
+    # against the first table when no size matches (the error below reports it).
+    reference = (
+        matches[0]["language_shapes"] if len(matches) == 1
+        else specs[0]["language_shapes"]
+    )
+    unexpected = sorted(language_keys - reference.keys())
+    missing = sorted(reference.keys() - language_keys)
+    if unexpected or missing or unsupported_prefixes or len(matches) != 1:
         details = []
-        if actual_counts != expected_counts:
+        if len(matches) != 1:
+            expected = "; ".join(
+                f"{spec['variant']}=(language, visual, total)={spec['counts']}"
+                for spec in specs
+            )
             details.append(
-                "tensor counts differ from the official 4B layout "
-                f"(language={len(language_keys)}, visual={len(visual_keys)}, total={len(keys)})"
+                "tensor counts differ from the official Qwen3-VL layouts "
+                f"(language={len(language_keys)}, visual={len(visual_keys)}, "
+                f"total={len(keys)}; expected {expected})"
             )
         if missing:
             details.append(f"missing language tensors: {', '.join(missing[:5])}")
@@ -578,9 +766,12 @@ def normalize_qwen3vl_state_dict(state_dict):
         if unsupported_prefixes:
             details.append(f"unsupported tensor names: {', '.join(unsupported_prefixes[:5])}")
         raise ValueError(
-            "Only the official Qwen3-VL 4B BF16 checkpoint layout is supported; "
+            "Only the official Qwen3-VL 4B or 8B BF16 checkpoint layout is supported; "
             + "; ".join(details)
         )
+
+    variant = matches[0]["variant"]
+    expected_shapes = matches[0]["language_shapes"]
 
     non_bf16 = sorted(
         (key, str(value.dtype))
@@ -590,7 +781,7 @@ def normalize_qwen3vl_state_dict(state_dict):
     if non_bf16:
         key, dtype = non_bf16[0]
         raise ValueError(
-            "Qwen3-VL 4B conversion accepts BF16 tensors only; "
+            f"Qwen3-VL {variant} conversion accepts BF16 tensors only; "
             f"{key!r} has dtype {dtype}."
         )
 
@@ -598,14 +789,14 @@ def normalize_qwen3vl_state_dict(state_dict):
         actual_shape = tuple(state_dict[key].shape)
         if actual_shape != expected_shape:
             raise ValueError(
-                f"Unsupported Qwen3-VL 4B tensor shape for {key!r}: "
+                f"Unsupported Qwen3-VL {variant} tensor shape for {key!r}: "
                 f"expected {expected_shape}, got {actual_shape}."
             )
-    for key, expected_shape in QWEN3VL_VISUAL_SIGNATURE_SHAPES.items():
+    for key, expected_shape in matches[0]["visual_shapes"].items():
         if key not in state_dict or tuple(state_dict[key].shape) != expected_shape:
             actual_shape = tuple(state_dict[key].shape) if key in state_dict else None
             raise ValueError(
-                f"Unsupported Qwen3-VL 4B visual signature for {key!r}: "
+                f"Unsupported Qwen3-VL {variant} visual signature for {key!r}: "
                 f"expected {expected_shape}, got {actual_shape}."
             )
 
@@ -614,10 +805,12 @@ def normalize_qwen3vl_state_dict(state_dict):
         for key, value in state_dict.items()
         if key.startswith(QWEN3VL_SOURCE_PREFIX)
     )
-    return SourceStateDict(
+    normalized = SourceStateDict(
         map_qwen3_state_dict(hf_state_dict).items(),
         architecture_hint="qwen3vl",
     )
+    normalized.qwen3vl_variant = variant
+    return normalized
 
 
 def normalize_source_state_dict(state_dict):
@@ -631,10 +824,28 @@ def normalize_source_state_dict(state_dict):
     )
 
 
+def _qwen3vl_arch(variant=None):
+    """A ModelQwen3VL carrying the checkpoint size to record in the GGUF metadata."""
+    model_arch = ModelQwen3VL()
+    if variant is None:
+        raise ValueError(
+            "Qwen3-VL source did not report its size; cannot choose between "
+            "the supported variants."
+        )
+    supported = {spec["variant"] for spec in qwen3vl_variant_specs()}
+    if variant not in supported:
+        raise ValueError(
+            f"Unsupported Qwen3-VL variant {variant!r}; "
+            f"supported variants: {', '.join(sorted(supported))}."
+        )
+    model_arch.qwen3vl_variant = variant
+    return model_arch
+
+
 def validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb):
     if model_arch.arch == "qwen3vl" and (quant_type_name != "Q8_CR" or max_size_mb is not None):
         raise ValueError(
-            "Qwen3-VL 4B BF16 conversion is currently supported only as a text-only "
+            "Qwen3-VL 4B/8B BF16 conversion is currently supported only as a text-only "
             "Q8_CR GGUF. Select Q8_CR and leave max_size_mb unset."
         )
 
@@ -642,7 +853,10 @@ def validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb):
 def add_model_metadata(writer, model_arch):
     if model_arch.arch == "qwen3vl":
         writer.add_bool(QWEN3VL_TEXT_ONLY_METADATA, True)
-        writer.add_string(QWEN3VL_VARIANT_METADATA, "4b")
+        writer.add_string(
+            QWEN3VL_VARIANT_METADATA,
+            model_arch.qwen3vl_variant,
+        )
 
 
 def is_model_arch(model, state_dict):
@@ -666,14 +880,14 @@ def is_model_arch(model, state_dict):
 def detect_arch(state_dict):
     architecture_hint = getattr(state_dict, "architecture_hint", None)
     if architecture_hint == "qwen3vl":
-        return ModelQwen3VL()
+        return _qwen3vl_arch(getattr(state_dict, "qwen3vl_variant", None))
     if architecture_hint is not None:
         raise ValueError(f"Unknown source architecture hint: {architecture_hint!r}.")
 
     if any(key.startswith(QWEN3VL_SOURCE_PREFIX) for key in state_dict):
         normalized = normalize_qwen3vl_state_dict(state_dict)
         if normalized is not None:
-            return ModelQwen3VL()
+            return _qwen3vl_arch(getattr(normalized, "qwen3vl_variant", None))
 
     model_arch = None
     for arch in arch_list:
@@ -701,7 +915,7 @@ def validate_key_patterns(model_arch, state_dict):
     variant that simply doesn't include that sub-module (see ModelKrea2's
     two keys_detect alternatives, which exist for exactly this reason).
     """
-    for attr in ("keys_hiprec", "keys_noquant", "keys_q8_cr", "keys_ignore"):
+    for attr in ("keys_hiprec", "keys_noquant", "keys_k_noquant", "keys_q8_cr", "keys_q8_cr_l", "keys_ignore"):
         for pattern in getattr(model_arch, attr, []):
             if not any(key_matches(key, [pattern]) for key in state_dict.keys()):
                 logging.warning(
@@ -732,11 +946,13 @@ QUANT_TYPE_MAP = {
     "Q5_K_S": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_S),
     "Q5_K_M": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_M),
     "Q8_CR": (gguf.GGMLQuantizationType.I8, None),  # INT8 ConvRot (ComfyUI native)
-    # Q4_CR_W4A4 is a custom W4A4 INT4 format backed by comfy_kitchen's fast
-    # ConvRot int4 tensor-core MMA. Stored as kitchen-native packed int4 (N, K//2)
-    # + per-output-row fp scales (no per-group scales/zeros).
+    # Q4_CR_W4A4 and Q4_CR_L share the ConvRot packed INT4 payload. The former
+    # runs INT4 activations; Q4_CR_L uses INT8 activations with the same layout.
     "Q4_CR_W4A4": (gguf.GGMLQuantizationType.I8, None),
+    "Q4_CR_L": (gguf.GGMLQuantizationType.I8, None),
     "Q4_CR": (gguf.GGMLQuantizationType.I8, None),  # Alias for Q4_CR_W4A4
+    # Experimental ConvRot binary weights with BF16/FP16 activations.
+    "Q1_CR_XL": (gguf.GGMLQuantizationType.I8, None),
     # Q4_PT is retired pending a performant Ampere W4A16 backend.
     # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
 }
@@ -746,6 +962,8 @@ TARGET_SIZE_Q8_TYPES = ("Q8_CR", "Q8_0")
 DEFAULT_TARGET_SIZE_Q8_TYPE = "Q8_CR"
 Q4_CR_W4A4_CONVROT_GROUP_SIZE = 256
 Q4_CR_W4A4_QUANT_GROUP_SIZE = 64
+Q1_CR_XL_CONVROT_GROUP_SIZE = 256
+Q1_CR_XL_QUANT_GROUP_SIZE = 64
 QUANTIZATION_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
 MEBIBYTE = 1024 * 1024
 K_QUANT_TYPES = frozenset((
@@ -903,6 +1121,17 @@ def plan_k_quantization(state_dict, model_arch, quant_type_name):
             continue
         if key.endswith(".comfy_quant") or key.endswith("_scale") and len(data.shape) == 0:
             continue
+        # Scaled INT8 sources carry per-output-row scales shaped (N, 1). They are
+        # consumed while restoring the INT8 weight and must not be planned as
+        # quantizable tensors of their own.
+        if (
+            key.endswith("_scale")
+            and len(data.shape) == 2
+            and data.shape[-1] == 1
+            and state_dict.get(key[:-len("_scale")]) is not None
+            and state_dict[key[:-len("_scale")]].dtype == torch.int8
+        ):
+            continue
         if len(data.shape) == 0 or len(data.shape) > MAX_TENSOR_DIMS:
             continue
 
@@ -911,7 +1140,10 @@ def plan_k_quantization(state_dict, model_arch, quant_type_name):
             plan[key] = gguf.GGMLQuantizationType.I8
         elif len(data.shape) == 1 or n_params <= QUANTIZATION_THRESHOLD or _k_matches_arch_pattern(key, model_arch.keys_hiprec):
             plan[key] = gguf.GGMLQuantizationType.F32
-        elif _k_matches_arch_pattern(key, model_arch.keys_noquant):
+        elif (
+            _k_matches_arch_pattern(key, model_arch.keys_noquant)
+            or _k_matches_arch_pattern(key, model_arch.keys_k_noquant)
+        ):
             plan[key] = _default_qtype(data)
         elif "conv" in key.lower():
             # K kernels are Linear-only. This also protects flattened Conv
@@ -924,7 +1156,7 @@ def plan_k_quantization(state_dict, model_arch, quant_type_name):
                     f"{quant_type_name} cannot quantize tensor {key!r} with shape "
                     f"{tuple(data.shape)}: the quantized row dimension must be divisible "
                     f"by the {K_QUANT_BLOCK_SIZE}-value K-quant block size. Protect this "
-                    "tensor with keys_noquant or use a non-K quantization type."
+                    "tensor with keys_noquant/keys_k_noquant or use a non-K quantization type."
                 )
             plan[key] = base_qtype
             eligible_keys.append(key)
@@ -1156,11 +1388,13 @@ def quantize_int4_cr_w4a4(
     quant_group_size=64,
     device=None,
     dtype=torch.bfloat16,
+    backing="w4a4",
 ):
     """
-    Quantize a 2D Linear weight to the ConvRot W4A4 path (Q4_CR_W4A4, backed by
-    comfy_kitchen's fast int4 tensor-core MMA).
+    Quantize a 2D Linear weight to the ConvRot INT4 path for Q4_CR_W4A4 or Q4_CR_L.
 
+    ``backing`` selects activation precision: ``w4a4`` for INT4 activations or
+    ``w4a8`` for INT8 activations. Both use the same comfy_kitchen layout.
     Storage matches comfy_kitchen's TensorCoreConvRotW4A4Layout contract so the
     loader can rebuild a QuantizedTensor without re-packing:
       qweight:  (N, K//2) int8        two signed int4 per byte, row-major
@@ -1174,17 +1408,29 @@ def quantize_int4_cr_w4a4(
     runtime rotates the activation back) is symmetric about zero: 7-bit signed
     emission range [-7, 7] with scale = absmax / 7.
     """
+    if backing not in {"w4a4", "w4a8"}:
+        raise ValueError(f"Unsupported Q4_CR INT4 backing: {backing!r}")
     if device is not None:
         weight = weight.to(device)
     if quant_group_size != 64:
-        raise ValueError("Q4_CR W4A4 requires quant_group_size 64 (int4 MMA kernel contract).")
+        raise ValueError("Q4_CR requires quant_group_size 64 (ConvRot INT4 kernel contract).")
+    if (
+        not isinstance(convrot_groupsize, int)
+        or isinstance(convrot_groupsize, bool)
+        or convrot_groupsize <= 0
+    ):
+        raise ValueError(
+            f"Q4_CR ConvRot group size must be a positive integer, got {convrot_groupsize!r}."
+        )
     weight = weight.to(torch.float32)
+    if weight.ndim != 2:
+        raise ValueError(f"Q4_CR requires a 2D Linear weight, got shape {tuple(weight.shape)}.")
     orig_shape = tuple(weight.shape)
     n, k = orig_shape
 
     if k % convrot_groupsize != 0:
         raise ValueError(
-            f"Q4_CR W4A4 convrot group size {convrot_groupsize} must divide input "
+            f"Q4_CR ConvRot group size {convrot_groupsize} must divide input "
             f"features {k} for tensor {orig_shape}."
         )
 
@@ -1194,8 +1440,29 @@ def quantize_int4_cr_w4a4(
     weight_rotated = torch.matmul(weight_grouped, h.T).reshape(n, k).float()
 
     absmax = weight_rotated.abs().amax(dim=1, keepdim=True).clamp_min(1e-10)
-    scales = absmax / 7.0
-    q = (weight_rotated / scales).round().clamp(-7, 7).to(torch.int8)
+    scales_absmax = (absmax / 7.0).to(torch.float16).to(torch.float32).clamp_min(1e-10)
+
+    # Analytical 2-step Lloyd-Max / LSQ per-row scale optimization.
+    # Hadamard-rotated rows are near-Gaussian across K >= 256 elements, so
+    # setting scale = absmax / 7 lets single 4-sigma tail values compress 99.9%
+    # of weights into [-3, +3]. Optimizing per-row MSE at FP16 scale precision
+    # reduces 4-bit quantization error by ~30% while falling back to absmax / 7
+    # on rows (such as uniform/synthetic rows) where absmax is already optimal.
+    rms = weight_rotated.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-10)
+    scales_opt = (rms * 0.355).clamp_max(scales_absmax)
+    for _ in range(2):
+        q_opt = (weight_rotated / scales_opt.clamp_min(1e-10)).round().clamp(-7, 7)
+        denom = q_opt.square().sum(dim=1, keepdim=True).clamp_min(1e-10)
+        scales_opt = (q_opt * weight_rotated).sum(dim=1, keepdim=True) / denom
+    scales_opt = scales_opt.clamp_min(1e-10).to(torch.float16).to(torch.float32).clamp_min(1e-10)
+
+    q_abs = (weight_rotated / scales_absmax).round().clamp(-7, 7)
+    q_opt = (weight_rotated / scales_opt).round().clamp(-7, 7)
+    err_abs = (q_abs * scales_absmax - weight_rotated).square().sum(dim=1, keepdim=True)
+    err_opt = (q_opt * scales_opt - weight_rotated).square().sum(dim=1, keepdim=True)
+    use_opt = err_opt < err_abs
+    scales = torch.where(use_opt, scales_opt, scales_absmax)
+    q = torch.where(use_opt, q_opt, q_abs).to(torch.int8)
 
     q_flat = q.to(torch.int32)
     lo = q_flat[:, 0::2] & 0x0F
@@ -1206,13 +1473,76 @@ def quantize_int4_cr_w4a4(
 
     quant_conf = {
         "format": "int4_cr",
-        "backing": "w4a4",
+        "backing": backing,
         "convrot_groupsize": convrot_groupsize,
         "quant_group_size": quant_group_size,
         "orig_shape": orig_shape,
         "sym": True,
     }
+    if backing == "w4a8":
+        quant_conf["linear_dtype"] = "int8"
     return packed, wscales, quant_conf, orig_shape
+
+
+def quantize_int1_cr_xl(
+    weight,
+    convrot_groupsize=Q1_CR_XL_CONVROT_GROUP_SIZE,
+    quant_group_size=Q1_CR_XL_QUANT_GROUP_SIZE,
+    device=None,
+):
+    """Quantize a 2D Linear weight to ConvRot 1-bit signs and FP16 group scales."""
+    from q1_cr_triton_backend import pack_int1_sign_bits
+
+    if device is not None:
+        weight = weight.to(device)
+    if weight.ndim != 2 or not weight.is_floating_point():
+        raise ValueError(
+            f"Q1_CR_XL requires a 2D floating-point Linear weight, got {tuple(weight.shape)}"
+        )
+    if (
+        not isinstance(convrot_groupsize, int)
+        or isinstance(convrot_groupsize, bool)
+        or convrot_groupsize <= 0
+        or not isinstance(quant_group_size, int)
+        or isinstance(quant_group_size, bool)
+        or quant_group_size <= 0
+        or quant_group_size % 8
+    ):
+        raise ValueError(
+            "Q1_CR_XL ConvRot and quantization group sizes must be positive integers, "
+            "and quant_group_size must be divisible by 8."
+        )
+
+    orig_shape = tuple(weight.shape)
+    n, k = orig_shape
+    if k % convrot_groupsize or k % quant_group_size:
+        raise ValueError(
+            f"Q1_CR_XL group sizes {convrot_groupsize}/{quant_group_size} must divide "
+            f"input features {k} for tensor {orig_shape}."
+        )
+    orig_dtype = str(weight.dtype).removeprefix("torch.")
+    weight_f32 = weight.to(torch.float32)
+    hadamard = _build_regular_hadamard(
+        convrot_groupsize,
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    rotated = (
+        weight_f32.reshape(n, k // convrot_groupsize, convrot_groupsize)
+        @ hadamard.T
+    ).reshape(n, k)
+    qdata, scales = pack_int1_sign_bits(rotated, quant_group_size)
+    quant_conf = {
+        "format": "int1_cr",
+        "backing": "w1a16",
+        "linear_dtype": "bf16",
+        "convrot_groupsize": convrot_groupsize,
+        "quant_group_size": quant_group_size,
+        "orig_shape": orig_shape,
+        "orig_dtype": orig_dtype,
+        "weight_rotated": True,
+    }
+    return qdata, scales, quant_conf, orig_shape
 
 
 def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
@@ -1412,7 +1742,7 @@ def parse_args():
         choices=list(QUANT_TYPE_MAP.keys()),
         default=None,
         help=(
-            "Target quantization type for eligible 2-D+ tensors. Qwen3-VL 4B BF16 "
+            "Target quantization type for eligible 2-D+ tensors. Qwen3-VL 4B/8B BF16 "
             "conversion currently requires Q8_CR and produces a text-only encoder. "
             "Raw Q4_K/Q5_K/Q6_K are uniform; Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M are "
             "deterministic mixed presets. 1-D biases/scales stay F32. Defaults to "
@@ -1443,7 +1773,7 @@ def parse_args():
         choices=QUANTIZATION_DEVICE_OPTIONS,
         default="auto",
         help=(
-            "Device for Q8_CR conversion. auto uses CUDA when available; CPU remains "
+            "Device for Q8_CR/Q4_CR/Q1_CR_XL conversion. auto uses CUDA when available; CPU remains "
             "the fallback for individual matrices that cannot fit in available VRAM."
         ),
     )
@@ -1578,6 +1908,16 @@ def handle_tensors(
                 tqdm.write(f"Filtering ignored key: '{key}'")
             continue
 
+        # comfy_attention configs request native attention kernels (for example
+        # INT8 attention) that only apply to the original checkpoint's own
+        # quantized weights. After GGUF conversion the weights are dequantized
+        # or requantized, so the directive must be dropped rather than emitted
+        # as bytes the loader would try to parse as JSON.
+        if key.endswith(".comfy_attention.config"):
+            if verbose:
+                tqdm.write(f"Dropping attention config tensor: '{key}'")
+            continue
+
         # comfy_quant tensors are FP8 scale factors specific to ComfyUI's custom FP8 format.
         # weight_scale tensors are 0-dim per-tensor FP8 scales (e.g. from torchao/fp8 fine-tunes).
         # Both are meaningless after GGUF re-quantization and must be dropped so the loader
@@ -1628,6 +1968,16 @@ def handle_tensors(
         for dim_size in data_shape:
             n_params *= dim_size
 
+        q8_cr_patterns = list(model_arch.keys_q8_cr)
+        if quant_type_name == "Q4_CR_L":
+            q8_cr_patterns.extend(getattr(model_arch, "keys_q8_cr_l", ()))
+        custom_cr_types = {
+            "Q4_CR",
+            "Q4_CR_W4A4",
+            "Q4_CR_L",
+            "Q1_CR_XL",
+        }
+
         apply_quantization_rules = (
             quant_type_name == "Q8_CR"
             or (
@@ -1664,7 +2014,7 @@ def handle_tensors(
                 # "last.modulation.lin" needs full F32, even though the
                 # broader "^last." keys_noquant entry also matches it).
                 data_qtype = gguf.GGMLQuantizationType.F32
-            elif key_matches(key, model_arch.keys_q8_cr) and quant_type_name in {"Q4_CR", "Q4_CR_W4A4"}:
+            elif key_matches(key, q8_cr_patterns) and quant_type_name in custom_cr_types:
                 data_qtype = gguf.GGMLQuantizationType.I8
             elif key_matches(key, model_arch.keys_noquant):
                 pass
@@ -1686,18 +2036,21 @@ def handle_tensors(
         # Q4_PT layout restrictions are retained with
         # retired_quantize_int4_pytorch and are intentionally not selectable.
 
-        # Q4_CR_W4A4 only supports Linear matrices whose K dimension is divisible
-        # by the ConvRot group size (default 256). Anything else falls back to F16
-        # to avoid a conversion-time crash on awkward shapes.
+        # ConvRot custom formats only support Linear matrices whose K dimension
+        # is divisible by their ConvRot group size. Other shapes remain F16.
         if (
-            quant_type_name in {"Q4_CR_W4A4", "Q4_CR"}
+            quant_type_name in custom_cr_types
+            and n_dims > 1
             and (
                 n_dims != 2
-                or data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE != 0
+                or (
+                    n_params > QUANTIZATION_THRESHOLD
+                    and data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE != 0
+                )
             )
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
-            and not key_matches(key, model_arch.keys_q8_cr)
+            and not key_matches(key, q8_cr_patterns)
             and not raw_byte_tensor
         ):
             data_qtype = gguf.GGMLQuantizationType.F16
@@ -1721,8 +2074,8 @@ def handle_tensors(
             and (
                 quant_type_name == "Q8_CR"
                 or (
-                    quant_type_name in {"Q4_CR", "Q4_CR_W4A4"}
-                    and key_matches(key, model_arch.keys_q8_cr)
+                    quant_type_name in custom_cr_types
+                    and key_matches(key, q8_cr_patterns)
                 )
             )
         ):
@@ -1768,17 +2121,69 @@ def handle_tensors(
                 progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
             continue
 
-        # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast ConvRot
-        # int4 tensor-core MMA. Serializes kitchen-native packed int4 (N, K//2)
+        # Q1_CR_XL uses packed little-endian sign bits and one FP16 scale per
+        # 64-weight group. The Qwen Image 2.1 architecture keeps attention in
+        # Q8_CR via keys_q8_cr and applies this format to eligible MLP matrices.
+        if (
+            quant_type_name == "Q1_CR_XL"
+            and data_qtype == gguf.GGMLQuantizationType.I8
+            and n_dims == 2
+            and data.shape[1] % Q1_CR_XL_CONVROT_GROUP_SIZE == 0
+            and not key_matches(key, model_arch.keys_hiprec)
+            and not key_matches(key, model_arch.keys_noquant)
+            and not key_matches(key, q8_cr_patterns)
+        ):
+            q1_cr_weight = torch.from_numpy(data)
+            if q4_cr_device is None:
+                q4_cr_device = resolve_quantization_device(quantization_device)
+            device = q4_cr_device
+            try:
+                qdata, scales, quant_conf, _orig_shape = quantize_int1_cr_xl(
+                    q1_cr_weight,
+                    convrot_groupsize=Q1_CR_XL_CONVROT_GROUP_SIZE,
+                    quant_group_size=Q1_CR_XL_QUANT_GROUP_SIZE,
+                    device=device,
+                )
+            except torch.OutOfMemoryError:
+                if device.type != "cuda":
+                    raise
+                torch.cuda.empty_cache()
+                logging.warning(
+                    "Q1_CR_XL CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    key,
+                )
+                qdata, scales, quant_conf, _orig_shape = quantize_int1_cr_xl(
+                    q1_cr_weight,
+                    convrot_groupsize=Q1_CR_XL_CONVROT_GROUP_SIZE,
+                    quant_group_size=Q1_CR_XL_QUANT_GROUP_SIZE,
+                    device=torch.device("cpu"),
+                )
+            writer.add_tensor(
+                key,
+                qdata.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.I8,
+            )
+            writer.add_tensor(
+                f"{key}_scale",
+                scales.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.F16,
+            )
+            writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
+            if progress_callback is not None:
+                progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
+            continue
+
+        # Q4_CR_W4A4 / Q4_CR_L: custom ConvRot INT4 backed by comfy_kitchen's
+        # ConvRot kernel (INT4 or INT8 activations). Serializes packed int4 (N, K//2)
         # + per-output-row fp scales (no per-group scales/zeros).
         if (
-            quant_type_name in {"Q4_CR_W4A4", "Q4_CR"}
+            quant_type_name in {"Q4_CR_W4A4", "Q4_CR", "Q4_CR_L"}
             and data_qtype == gguf.GGMLQuantizationType.I8
             and n_dims == 2
             and data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE == 0
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
-            and not key_matches(key, model_arch.keys_q8_cr)
+            and not key_matches(key, q8_cr_patterns)
         ):
             qdata_q4 = torch.from_numpy(data)
             if q4_cr_device is None:
@@ -1790,13 +2195,14 @@ def handle_tensors(
                     convrot_groupsize=Q4_CR_W4A4_CONVROT_GROUP_SIZE,
                     quant_group_size=Q4_CR_W4A4_QUANT_GROUP_SIZE,
                     device=device,
+                    backing="w4a8" if quant_type_name == "Q4_CR_L" else "w4a4",
                 )
             except torch.OutOfMemoryError:
                 if device.type != "cuda":
                     raise
                 torch.cuda.empty_cache()
                 logging.warning(
-                    "Q4_CR_W4A4 CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    "Q4_CR CUDA fallback for %s: CUDA ran out of memory while quantizing.",
                     key,
                 )
                 qdata, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
@@ -1804,6 +2210,7 @@ def handle_tensors(
                     convrot_groupsize=Q4_CR_W4A4_CONVROT_GROUP_SIZE,
                     quant_group_size=Q4_CR_W4A4_QUANT_GROUP_SIZE,
                     device=torch.device("cpu"),
+                    backing="w4a8" if quant_type_name == "Q4_CR_L" else "w4a4",
                 )
             writer.add_tensor(
                 key,
@@ -1902,13 +2309,13 @@ def convert_file(
             lora_strengths=lora_strengths,
         )
     state_dict = load_state_dict(path, progress_callback=progress_callback)
-    restored_int8_count = materialize_int8_source_weights(state_dict)
+    source_metadata = load_safetensors_metadata(path)
+    restored_int8_count = materialize_int8_source_weights(state_dict, source_metadata)
     if restored_int8_count:
         logging.info(
             "Restored %d scaled INT8 source weight(s) to FP16 before conversion.",
             restored_int8_count,
         )
-    source_metadata = load_safetensors_metadata(path)
     lora_paths = lora_paths or []
     lora_strengths = lora_strengths or []
     if lora_strengths and len(lora_strengths) != len(lora_paths):
@@ -2080,8 +2487,30 @@ def convert_safetensors_streamed(
     try:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
             total = len(state_dict)
-            for index, (key, _) in enumerate(state_dict.items(), start=1):
-                data = checkpoint.get_tensor(source_keys[key])
+            consumed_int8_metadata = set()
+            for index, (key, layout_tensor) in enumerate(state_dict.items(), start=1):
+                source_key = source_keys[key]
+                if source_key in consumed_int8_metadata:
+                    continue
+                data = checkpoint.get_tensor(source_key)
+                if data.dtype == torch.int8:
+                    scale_key = f"{key}_scale"
+                    conf_key = f"{key[:-len('weight')]}comfy_quant" if key.endswith("weight") else None
+                    metadata = {key: data}
+                    if scale_key in source_keys:
+                        source_scale_key = source_keys[scale_key]
+                        metadata[scale_key] = checkpoint.get_tensor(source_scale_key)
+                        consumed_int8_metadata.add(source_scale_key)
+                    if conf_key in source_keys:
+                        source_conf_key = source_keys[conf_key]
+                        metadata[conf_key] = checkpoint.get_tensor(source_conf_key)
+                        consumed_int8_metadata.add(source_conf_key)
+                    materialize_int8_source_weights(metadata, source_metadata)
+                    data = metadata[key]
+                elif key.endswith("_scale") and key[:-len("_scale")] in state_dict:
+                    paired_key = key[:-len("_scale")]
+                    if layout_tensor.dtype == torch.float32 and state_dict[paired_key].dtype == torch.int8:
+                        continue
                 if key in resolved_loras:
                     source_scale = None
                     scale_key = f"{key}_scale"

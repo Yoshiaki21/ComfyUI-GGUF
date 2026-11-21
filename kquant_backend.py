@@ -1,5 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
-"""Optional native Linear backend for GGML K-quant weights.
+"""Accelerated Linear backend for GGML K-quant weights.
 
 An accelerator package may either call :func:`register_kquant_backend` during
 import or expose ``linear`` (and optionally ``supports``) from the module named
@@ -18,13 +18,14 @@ import torch
 
 SUPPORTED_K_QUANTS = frozenset(
     {
+        gguf.GGMLQuantizationType.Q3_K,
         gguf.GGMLQuantizationType.Q4_K,
         gguf.GGMLQuantizationType.Q5_K,
         gguf.GGMLQuantizationType.Q6_K,
     }
 )
 _BACKEND_ENV = "COMFYUI_GGUF_KQUANT_BACKEND"
-_DEFAULT_BACKEND_MODULE = "comfyui_gguf_kquant"
+_DEFAULT_BACKEND = "bundled"
 _LOCAL_BACKEND_MODULE = ".kquant_triton_backend"
 _backend = None
 _backend_checked = False
@@ -63,19 +64,31 @@ def _load_backend():
         if _backend_checked:
             return _backend
 
-        configured_module = os.environ.get(_BACKEND_ENV, "").strip()
-        candidates = [configured_module] if configured_module else [_DEFAULT_BACKEND_MODULE]
+        configured_module = os.environ.get(_BACKEND_ENV, _DEFAULT_BACKEND).strip()
         if not configured_module:
-            candidates.append(_LOCAL_BACKEND_MODULE)
+            configured_module = _DEFAULT_BACKEND
+        if configured_module.lower() in {"none", "off", "disabled", "false"}:
+            _backend_checked = True
+            logging.info(
+                "ComfyUI-GGUF: K-quant backend opted out via %s=%r; "
+                "using portable dequantization",
+                _BACKEND_ENV,
+                configured_module,
+            )
+            return None
+
+        candidates = (
+            [_LOCAL_BACKEND_MODULE]
+            if configured_module.lower() == "bundled"
+            else [configured_module]
+        )
         last_error = None
         for module_name in candidates:
             try:
                 module = importlib.import_module(module_name, package=__package__)
                 if _backend is None:
                     _backend = _module_backend(module)
-                logging.info(
-                    "ComfyUI-GGUF: enabled optional K-quant backend %s", module_name
-                )
+                logging.info("ComfyUI-GGUF: enabled K-quant backend %s", module_name)
                 break
             except ModuleNotFoundError as error:
                 last_error = error
@@ -141,8 +154,30 @@ def _backend_supports(backend, *, qtype, input_tensor, qdata, weight_shape):
     )
 
 
-def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
-    """Return native Linear output, or ``None`` when fallback should be used."""
+def _backend_should_use(backend, *, qtype, input_tensor, qdata, weight_shape, dequant_dtype):
+    should_use = getattr(backend, "should_use", None)
+    precision_kwargs = (
+        {"dequant_dtype": dequant_dtype}
+        if getattr(backend, "supports_dequant_dtype", False)
+        else {}
+    )
+    if not callable(should_use):
+        return True
+    return bool(
+        should_use(
+            qtype=qtype.name,
+            device=input_tensor.device,
+            input_dtype=input_tensor.dtype,
+            input_shape=tuple(input_tensor.shape),
+            weight_shape=weight_shape,
+            weight_dtype=qdata.dtype,
+            **precision_kwargs,
+        )
+    )
+
+
+def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None, *, dequant_dtype="target"):
+    """Return accelerated Linear output, or ``None`` when fallback should be used."""
     if qtype not in SUPPORTED_K_QUANTS or not torch.is_tensor(qdata):
         return None
 
@@ -156,13 +191,16 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
     if qdata.device != input_tensor.device or not _valid_storage(qdata, qtype, weight_shape):
         return None
 
-    out_features, in_features = weight_shape
-    _, type_size = gguf.GGML_QUANT_SIZES[qtype]
-    row_bytes = (in_features // 256) * type_size
-    qdata = qdata.reshape((out_features, row_bytes)).contiguous()
-
+    # Gate on backend availability before paying for any repacking: the
+    # reshape/contiguous below copies whole weight storages, so it must not
+    # run on routes that fall back to portable dequantization anyway.
     backend = _load_backend()
     if backend is None:
+        return None
+    decode_dtype = input_tensor.dtype if dequant_dtype == "target" else dequant_dtype
+    decode_dtype = torch.float16 if decode_dtype is None else decode_dtype
+    precision_aware = getattr(backend, "supports_dequant_dtype", False)
+    if not precision_aware and decode_dtype != input_tensor.dtype:
         return None
 
     route = _route_key(backend, qtype, input_tensor)
@@ -176,14 +214,27 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
             input_tensor=input_tensor,
             qdata=qdata,
             weight_shape=weight_shape,
+        ) or not _backend_should_use(
+            backend,
+            qtype=qtype,
+            input_tensor=input_tensor,
+            qdata=qdata,
+            weight_shape=weight_shape,
+            dequant_dtype=decode_dtype,
         ):
             return None
+        out_features, in_features = weight_shape
+        _, type_size = gguf.GGML_QUANT_SIZES[qtype]
+        row_bytes = (in_features // 256) * type_size
+        packed = qdata.reshape((out_features, row_bytes)).contiguous()
+        precision_kwargs = {"dequant_dtype": decode_dtype} if precision_aware else {}
         output = backend.linear(
             input=input_tensor,
-            weight=qdata.contiguous(),
+            weight=packed,
             qtype=qtype.name,
             weight_shape=weight_shape,
             bias=bias,
+            **precision_kwargs,
         )
         expected_shape = (*input_tensor.shape[:-1], weight_shape[0])
         if not torch.is_tensor(output) or tuple(output.shape) != expected_shape:
