@@ -61,6 +61,7 @@
 | 変換ツール | `tools/convert.py` |
 | テスト | `tests/`（実行方法は「よく使うコマンド」） |
 | K系展開の参照実装一致テスト／ROCm ゲートのテスト | `tests/test_kquant_dequant.py` |
+| ROCm のピン留めメモリ回避（レガシーローダー） | `nodes.py`（`_rocm_unaligned_pin`）、`tests/test_rocm_pinned_memory.py` |
 | 設計資料 | `ARCHITECTURE.md`, `AGENTS.md`, `docs/k-quant-inference.md` |
 | 参照用 leejet 版（読むだけ。必要時に clone） | https://github.com/leejet/ComfyUI-GGUF（`dequant.py`/`ops.py` は city96 版と同一） |
 | 参照用 city96 版（差分の基準。必要時に clone） | https://github.com/city96/ComfyUI-GGUF |
@@ -97,6 +98,7 @@ journalctl --user -u comfyui-igpu --no-pager | grep -i gguf
 
 - 本リポジトリはコンテナ `comfyui-igpu` の `/app/custom_nodes/ComfyUI-GGUF` にマウントされている。チェックアウト中のブランチが ComfyUI 再起動後にそのまま反映される。
 - `state_dict()` の量子化重みは `[行数, 行あたりバイト]` の meta テンソルで返す（ComfyUI の LoRA キー対応が `shape[0]` を出力行数として使うため。上流の 1 次元形式だと MOSS の融合 qkv LoRA が落ちる）。
+- ROCm ではページ境界に揃っていないテンソルを `cudaHostRegister` でピン留めすると末尾ページが GPU にマップされず、DMA 時に "Memory access fault ... Page not present" で落ちる。レガシーローダーではそうした重みのピン留めを飛ばす（dGPU の部分ロード時のみ発生。iGPU は ComfyUI がピン留めを無効化するため起きない）。
 - ROCm 版 PyTorch でも `device.type == "cuda"` になる。CUDA 前提の分岐が AMD GPU でも有効になる点に注意。
 - 同梱の K系 Triton カーネルは ROCm では既定で無効（旧融合 matmul 版が展開→rocBLAS より約4倍遅かったため）。有効化は `COMFYUI_GGUF_KQUANT_TRITON_ROCM=1`。ただし上流版は SM 8.6 限定の起動条件があり、現状は有効化しても AMD では動かない（ゲートは安全弁）。
 - 8060S のコンテナで上流そのままでも失敗するテストが3件ある（環境依存）：Q1_CR_XL の CUDA Triton（comfy_kitchen の API 不一致）、`test_gguf_state_size` の Q8_0、MOSS の PYTHONPATH なし変換（`comfy` を import できない）。

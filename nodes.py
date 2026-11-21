@@ -51,6 +51,38 @@ from .lora import load_gguf_lora, materialize_int8_source_weights
 
 _DYNAMIC_VRAM_LORA_WARNING_MIN_BYTES = 64 * 1024 * 1024
 
+_HOST_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+_rocm_unaligned_pin_logged = False
+
+
+def _rocm_unaligned_pin(model, key):
+    """本フォークでの修正：ROCm でページ境界に揃っていないテンソルのピン留めを避ける。
+
+    ComfyUI の pin_memory は cudaHostRegister(ptr, nbytes) をそのまま呼ぶ。ROCm（HIP）では
+    ptr がページ境界にないと末尾ページが GPU にマップされず、そのテンソルを DMA した時点で
+    "Memory access fault ... Page not present" で落ちる（RX 9070 XT / 8060S で再現・確認）。
+    レガシーローダーの GGUF は mmap からの切り離しで作った CPU コピー（64 バイト境界）を
+    ピン留めするため該当する。ピン留めしなくても転送は通常経路で正しく行われる。
+    """
+    global _rocm_unaligned_pin_logged
+    if getattr(torch.version, "hip", None) is None:
+        return False
+    try:
+        weight = comfy.utils.get_attr(model, key)
+    except AttributeError:
+        return False
+    if not isinstance(weight, torch.Tensor) or weight.device.type != "cpu":
+        return False
+    if weight.data_ptr() % _HOST_PAGE_SIZE == 0:
+        return False
+    if not _rocm_unaligned_pin_logged:
+        _rocm_unaligned_pin_logged = True
+        logging.info(
+            "ComfyUI-GGUF: skipping pinned memory for non page-aligned weights on ROCm "
+            "(HIP host registration does not map their last page)"
+        )
+    return True
+
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -252,6 +284,8 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             # TODO: possible to OOM, find better way to detach
             self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
             del self.named_modules_to_munmap[op_key]
+        if _rocm_unaligned_pin(self.model, key):
+            return
         super().pin_weight_to_device(key)
 
     mmap_released = False
