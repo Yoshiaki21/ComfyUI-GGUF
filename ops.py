@@ -669,6 +669,16 @@ def _ggml_fake_state_tensor(tensor):
             getattr(tensor, "tensor_shape", tensor.shape),
         )
         if packed is not None:
+            # 本フォークでの修正：上流は 1 次元 [packed] で返していたが、ComfyUI の LoRA キー対応
+            # （MOSS / Flux3 の融合 qkv 分割など）は state_dict の shape[0] を出力行数として使う。
+            # GGML のブロックは最終次元に沿って並ぶので、[行数, 行あたりバイト] の 2 次元にすれば
+            # バイト数（VRAM 見積もり）を変えずに shape[0] を論理形状と一致させられる。
+            shape = getattr(tensor, "tensor_shape", tensor.shape)
+            rows = int(shape[0]) if len(shape) >= 2 else 0
+            if rows > 0 and packed % rows == 0:
+                return torch.empty(
+                    (rows, packed // rows), dtype=torch.uint8, device=torch.device("meta")
+                )
             return torch.empty(packed, dtype=torch.uint8, device=torch.device("meta"))
     return torch.zeros_like(tensor, device=torch.device("meta"))
 

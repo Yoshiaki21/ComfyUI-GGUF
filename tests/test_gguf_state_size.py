@@ -126,6 +126,25 @@ class GGUFStateSizeTests(unittest.TestCase):
         self.assertEqual(fake.nbytes, packed)
         self.assertEqual(packed, 64 * 16 * 176)
 
+    def test_state_dict_keeps_logical_rows_for_lora_offsets(self):
+        # ComfyUI の MOSS / Flux3 LoRA キー対応は sd[k].shape[0] // 3 で融合 qkv を分割する。
+        # パック済みバイト数を返しつつ、shape[0] は論理的な出力行数のままであること。
+        for qtype_name in ("Q8_0", "Q4_K", "Q6_K"):
+            with self.subTest(qtype=qtype_name):
+                qtype = gguf.GGMLQuantizationType[qtype_name]
+                block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+                rows, cols = 9216, 3072
+                raw = torch.zeros(rows * (cols // block_size) * type_size, dtype=torch.uint8)
+                weight = self.ops.GGMLTensor(
+                    raw, tensor_type=qtype, tensor_shape=torch.Size((rows, cols)),
+                    compute_dtype=torch.float16,
+                )
+                layer = self.ops.GGMLOps.Linear(cols, rows, bias=False, dtype=torch.float16)
+                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                fake = layer.state_dict()["weight"]
+                self.assertEqual(fake.shape[0], rows)
+                self.assertEqual(fake.nbytes, raw.numel())
+
 
 if __name__ == "__main__":
     unittest.main()
