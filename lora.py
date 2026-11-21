@@ -69,8 +69,18 @@ def _unrotate_convrot_weight(weight, group_size):
     ).reshape_as(weight)
 
 
-def materialize_int8_source_weights(state_dict):
+def materialize_int8_source_weights(state_dict, source_metadata=None):
     """Restore scaled INT8 weights, reversing ConvRot before LoRA fusion or export."""
+    layer_metadata = {}
+    if source_metadata:
+        encoded_metadata = source_metadata.get("_quantization_metadata")
+        if encoded_metadata:
+            try:
+                parsed_metadata = json.loads(encoded_metadata)
+                layer_metadata = parsed_metadata.get("layers", {})
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ValueError("Source INT8 quantization metadata is invalid JSON.") from error
+
     int8_keys = [
         key for key, value in state_dict.items()
         if isinstance(value, torch.Tensor) and value.dtype == torch.int8
@@ -106,6 +116,16 @@ def materialize_int8_source_weights(state_dict):
             ) from error
 
         quant_conf, quant_key = _read_int8_quant_config(state_dict, weight_key)
+        if quant_conf is None and layer_metadata:
+            layer_key = weight_key[:-len(".weight")]
+            quant_conf = layer_metadata.get(layer_key)
+            if quant_conf is None:
+                matches = [
+                    config for source_key, config in layer_metadata.items()
+                    if source_key.endswith("." + layer_key)
+                ]
+                if len(matches) == 1:
+                    quant_conf = matches[0]
         if quant_conf is not None:
             if quant_conf.get("format") != "int8_tensorwise":
                 raise ValueError(
@@ -117,7 +137,8 @@ def materialize_int8_source_weights(state_dict):
                     restored,
                     int(quant_conf.get("convrot_groupsize", 256)),
                 )
-            del state_dict[quant_key]
+            if quant_key in state_dict:
+                del state_dict[quant_key]
 
         state_dict[weight_key] = restored.to(dtype=torch.float16)
         del state_dict[scale_key]

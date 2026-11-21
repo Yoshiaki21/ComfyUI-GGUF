@@ -51,7 +51,9 @@
 | 実行時の重みラッパー・on-the-fly 展開（通常経路） | `ops.py`（`GGMLLayer` / `GGMLOps.Linear`） |
 | Dynamic VRAM 経路の展開・Linear ディスパッチ | `quant_ops.py`（`GGMLLayout`） |
 | K系 Linear のネイティブバックエンド選択・フォールバック | `kquant_backend.py`（`try_kquant_linear`） |
-| K系 Triton 融合 matmul カーネル | `kquant_triton_backend.py` |
+| K系 Triton 展開カーネル（展開→PyTorch Linear。ROCm ゲート `_rocm_allowed`） | `kquant_triton_backend.py` |
+| Q1_CR_XL（実験的 W1A16）Triton 展開 | `q1_cr_triton_backend.py` |
+| パッチ再適用の要否判定（issue #26 プリロード対策） | `patch_state.py` |
 | 展開／matmul／K系カーネルの所要時間計測（切り分け用、既定無効） | `dequant_profile.py`（`COMFYUI_GGUF_DEQUANT_PROFILE=1`） |
 | GGUF 読み込み・メタデータ・アーキ判定 | `loader.py` |
 | ComfyUI ノード定義 | `nodes.py` |
@@ -59,6 +61,7 @@
 | 変換ツール | `tools/convert.py` |
 | テスト | `tests/`（実行方法は「よく使うコマンド」） |
 | K系展開の参照実装一致テスト／ROCm ゲートのテスト | `tests/test_kquant_dequant.py` |
+| ROCm のピン留めメモリ回避（レガシーローダー） | `nodes.py`（`_rocm_unaligned_pin`）、`tests/test_rocm_pinned_memory.py` |
 | 設計資料 | `ARCHITECTURE.md`, `AGENTS.md`, `docs/k-quant-inference.md` |
 | 参照用 leejet 版（読むだけ。必要時に clone） | https://github.com/leejet/ComfyUI-GGUF（`dequant.py`/`ops.py` は city96 版と同一） |
 | 参照用 city96 版（差分の基準。必要時に clone） | https://github.com/city96/ComfyUI-GGUF |
@@ -77,9 +80,12 @@
 # テスト：ホストには torch がないため、同じイメージの使い捨てコンテナで実行する（稼働中コンテナには触れない）
 # GPU テストも走らせる場合は --device /dev/kfd --device /dev/dri を付け、HIP_VISIBLE_DEVICES で 8060S を選ぶ
 podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups --security-opt seccomp=unconfined \
-  -v $PWD:/work:ro -v /home/lucifar/data/comfyui/app-rocm10:/app:ro -v /home/lucifar/data/comfyui/venv-rocm10:/opt/venv:ro \
+  -v $PWD:/work:ro -v /home/lucifar/data/comfyui/app:/app:ro -v /home/lucifar/data/comfyui/venv:/opt/venv:ro \
   -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/app:/work -w /work --entrypoint /bin/bash registry.gskraft.com/comfyui-rocm10 \
   -c 'export HIP_VISIBLE_DEVICES=$(/opt/venv/bin/python3 /opt/get_gpu_index.py 8060S); /opt/venv/bin/python3 -m unittest discover -s tests -t .'
+
+# 上流（molbal）の取り込み：remote upstream-molbal を fetch し、作業ブランチでマージ
+git fetch upstream-molbal && git merge --no-ff upstream-molbal/main
 
 # ComfyUI のログ確認（読み取りのみ）
 journalctl --user -u comfyui-igpu --no-pager | grep -i gguf
@@ -90,10 +96,12 @@ journalctl --user -u comfyui-igpu --no-pager | grep -i gguf
 
 ### 6. 既知の制約・注意点
 
-- 本リポジトリはコンテナ `comfyui-igpu` の `/app/custom_nodes/ComfyUI-GGUF` にバインドマウントされている。編集は ComfyUI 再起動後に即反映される。
+- 本リポジトリはコンテナ `comfyui-igpu` の `/app/custom_nodes/ComfyUI-GGUF` にマウントされている。チェックアウト中のブランチが ComfyUI 再起動後にそのまま反映される。
+- `state_dict()` の量子化重みは `[行数, 行あたりバイト]` の meta テンソルで返す（ComfyUI の LoRA キー対応が `shape[0]` を出力行数として使うため。上流の 1 次元形式だと MOSS の融合 qkv LoRA が落ちる）。
+- ROCm ではページ境界に揃っていないテンソルを `cudaHostRegister` でピン留めすると末尾ページが GPU にマップされず、DMA 時に "Memory access fault ... Page not present" で落ちる。レガシーローダーではそうした重みのピン留めを飛ばす（dGPU の部分ロード時のみ発生。iGPU は ComfyUI がピン留めを無効化するため起きない）。
 - ROCm 版 PyTorch でも `device.type == "cuda"` になる。CUDA 前提の分岐が AMD GPU でも有効になる点に注意。
-- 同梱の K系 Triton カーネルは ROCm では既定で無効（拡散モデルで展開→rocBLAS より約4倍遅かったため）。有効化は `COMFYUI_GGUF_KQUANT_TRITON_ROCM=1`。
-- `test_targeted_quantization` の Q4_CR / MiniMax H3 関連 5件は main の時点で失敗している（今回の変更とは無関係）。
+- 同梱の K系 Triton カーネルは ROCm では既定で無効（旧融合 matmul 版が展開→rocBLAS より約4倍遅かったため）。有効化は `COMFYUI_GGUF_KQUANT_TRITON_ROCM=1`。ただし上流版は SM 8.6 限定の起動条件があり、現状は有効化しても AMD では動かない（ゲートは安全弁）。
+- 8060S のコンテナで上流そのままでも失敗するテストが3件ある（環境依存）：Q1_CR_XL の CUDA Triton（comfy_kitchen の API 不一致）、`test_gguf_state_size` の Q8_0、MOSS の PYTHONPATH なし変換（`comfy` を import できない）。
 - ComfyUI を import する既存テスト（`test_kquant_backend` など）は、GPU が見えない環境では ComfyUI 側の初期化で失敗する。
 - 実機: Radeon 8060S（gfx1151、iGPU）、ROCm 10.0。今後 gfx1201（RX 9070 XT / R9700）も使用予定。
 - モデル置き場: `/home/lucifar/data/comfyui/models/`（削除・移動しない）。
@@ -101,6 +109,7 @@ journalctl --user -u comfyui-igpu --no-pager | grep -i gguf
 
 ### 7. 変更履歴（任意）
 
+- 2026-11-21: molbal 上流（〜2026-11-16、v26.11.16）をマージ。Q3_K、Q1_CR_XL、Q4_CR_L の HIP 経路などを取り込み。
 - 2026-10-11: ROCm で同梱 K系 Triton カーネルを既定無効化。Qwen-Image 2.1 Q6_K が 24.70 → 5.26 s/it（8060S 実測）。
 
 ---

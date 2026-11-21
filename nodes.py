@@ -37,6 +37,7 @@ from .loader import (
     gguf_tensor_count,
 )
 from .dequant import dequantize_tensor, is_quantized, is_torch_compatible
+from .patch_state import requires_patch_reinstall
 from .tools.convert import (
     DEFAULT_TARGET_SIZE_Q8_TYPE,
     QUANT_TYPE_MAP,
@@ -49,6 +50,38 @@ from .lora import load_gguf_lora, materialize_int8_source_weights
 
 
 _DYNAMIC_VRAM_LORA_WARNING_MIN_BYTES = 64 * 1024 * 1024
+
+_HOST_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+_rocm_unaligned_pin_logged = False
+
+
+def _rocm_unaligned_pin(model, key):
+    """本フォークでの修正：ROCm でページ境界に揃っていないテンソルのピン留めを避ける。
+
+    ComfyUI の pin_memory は cudaHostRegister(ptr, nbytes) をそのまま呼ぶ。ROCm（HIP）では
+    ptr がページ境界にないと末尾ページが GPU にマップされず、そのテンソルを DMA した時点で
+    "Memory access fault ... Page not present" で落ちる（RX 9070 XT / 8060S で再現・確認）。
+    レガシーローダーの GGUF は mmap からの切り離しで作った CPU コピー（64 バイト境界）を
+    ピン留めするため該当する。ピン留めしなくても転送は通常経路で正しく行われる。
+    """
+    global _rocm_unaligned_pin_logged
+    if getattr(torch.version, "hip", None) is None:
+        return False
+    try:
+        weight = comfy.utils.get_attr(model, key)
+    except AttributeError:
+        return False
+    if not isinstance(weight, torch.Tensor) or weight.device.type != "cpu":
+        return False
+    if weight.data_ptr() % _HOST_PAGE_SIZE == 0:
+        return False
+    if not _rocm_unaligned_pin_logged:
+        _rocm_unaligned_pin_logged = True
+        logging.info(
+            "ComfyUI-GGUF: skipping pinned memory for non page-aligned weights on ROCm "
+            "(HIP host registration does not map their last page)"
+        )
+    return True
 
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -171,7 +204,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         weight = comfy.utils.get_attr(self.model, key)
 
         patches = self.patches[key]
-        # Legacy Q4_CR (INT4) path: the base weight stays packed (plain
+        # Legacy custom ConvRot paths: the base weight stays packed (plain
         # Parameter) and adapters run through the module's weight_function
         # (native low-rank bypass or fused fallback). Fusing directly with
         # calculate_weight here would corrupt the packed INT4 bytes.
@@ -188,7 +221,8 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 out_weight = weight.to(device_to)
                 patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
                 install_patch(patches, key)
-                logging.warning(f"Q4_CR type GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
+                self._gguf_patches_installed = True
+                logging.warning(f"Custom ConvRot quantized GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
                 if inplace_update:
                     comfy.utils.copy_to_param(self.model, key, out_weight)
                 else:
@@ -203,6 +237,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 install_patch(patches, key)
             # TODO: do we ever have legitimate duplicate patches? (i.e. patch on top of patched weight)
             out_weight.patches = [(patches, key)]
+            self._gguf_patches_installed = True
         else:
             inplace_update = self.weight_inplace_update or inplace_update
             if key not in self.backup:
@@ -227,6 +262,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if unpatch_weights:
             self._evict_gguf_quantized_caches()
             self._gguf_patch_layout_signature = None
+            self._gguf_patches_installed = False
             for module in self.model.modules():
                 if getattr(module, "_gguf_static_patch", False):
                     module.weight_function = []
@@ -248,13 +284,15 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             # TODO: possible to OOM, find better way to detach
             self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
             del self.named_modules_to_munmap[op_key]
+        if _rocm_unaligned_pin(self.model, key):
+            return
         super().pin_weight_to_device(key)
 
     mmap_released = False
     named_modules_to_munmap = {}
 
     def partially_unload(self, *args, force_patch_weights=False, **kwargs):
-        result = super().partially_unload(*args, force_patch_weights=True, **kwargs)
+        result = super().partially_unload(*args, force_patch_weights=force_patch_weights or requires_patch_reinstall(self), **kwargs)
         if args:
             self._move_gguf_quantized_caches(args[0])
         elif "device_to" in kwargs:
@@ -262,14 +300,18 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         return result
 
     def partially_load(self, *args, force_patch_weights=False, **kwargs):
-        return super().partially_load(*args, force_patch_weights=True, **kwargs)
+        return super().partially_load(*args, force_patch_weights=force_patch_weights or requires_patch_reinstall(self), **kwargs)
 
     def load(self, *args, force_patch_weights=False, **kwargs):
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
 
-        # always call `patch_weight_to_device` even for lowvram
-        super().load(*args, force_patch_weights=True, **kwargs)
+        # Route GGUF quantized patches through patch_weight_to_device (the
+        # default low-VRAM path would bind them to weight_function lists the
+        # GGML forward path ignores), but only when reinstallation is
+        # actually required: forcing unconditionally makes every
+        # load_models_gpu call pay a full unload+reload cycle (issue #26).
+        super().load(*args, force_patch_weights=force_patch_weights or requires_patch_reinstall(self), **kwargs)
         self._prepare_gguf_quantized_weights()
 
         # make sure nothing stays linked to mmap after first load
@@ -305,6 +347,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_released = getattr(self, "mmap_released", False)
         n._gguf_patch_layout_signature = getattr(self, "_gguf_patch_layout_signature", None)
+        n._gguf_patches_installed = getattr(self, "_gguf_patches_installed", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0 # force recalc
         return n
@@ -513,8 +556,9 @@ class TargetedQuantizationGGUF:
                         "tooltip": (
                             "TARGET_SIZE starts at the selected Q8 type, reduces central core matrices "
                             "to Q5_0 then Q4_0, then ordinary 1-D tensors to BF16 only when necessary. "
-                            "Raw Q4_K/Q5_K/Q6_K selections are uniform; K types ending in _S or _M "
-                            "use deterministic mixed per-tensor precision."
+                            "Q4_CR_L uses INT4 weights with INT8 activations; Q4_CR and Q4_CR_W4A4 "
+                            "retain their existing W4A4 behavior. Raw Q4_K/Q5_K/Q6_K selections are "
+                            "uniform; K types ending in _S or _M use deterministic mixed per-tensor precision."
                         ),
                     },
                 ),
@@ -543,8 +587,8 @@ class TargetedQuantizationGGUF:
                     {
                         "default": "auto",
                         "tooltip": (
-                            "Q8_CR conversion device. auto uses CUDA when available and "
-                            "falls back to CPU per matrix when VRAM is insufficient."
+                            "Q8_CR / Q4_CR conversion device. auto uses CUDA when available "
+                            "and falls back to CPU per matrix when VRAM is insufficient."
                         ),
                     },
                 ),
@@ -857,6 +901,13 @@ def _legacy_gguf_ops(extra, compute_dtype=None):
         )
     if mode == "int4_cr_w4a4":
         return get_gguf_q4_w4a4_ops(compute_dtype=compute_dtype)()
+    if mode == "int4_cr_w4a8":
+        return get_gguf_q4_w4a4_ops(
+            compute_dtype=compute_dtype,
+            default_linear_dtype="int8",
+        )()
+    if mode == "int1_cr_xl":
+        return get_gguf_q4_w4a4_ops(compute_dtype=compute_dtype)()
     return GGMLOps()
 
 
@@ -1154,7 +1205,7 @@ class CLIPLoaderGGUF:
                     and "int8_tensorwise" in extra.get("gguf_quant_formats", ())
                 ):
                     raise RuntimeError(
-                        "Qwen3-VL 4B Q8_CR text encoders require CLIPLoaderGGUFDynamicVRAM. "
+                        "Qwen3-VL text-only Q8_CR text encoders require CLIPLoaderGGUFDynamicVRAM. "
                         "Use the single-CLIP Dynamic VRAM loader for native INT8 or its safe fallback."
                     )
             else:
@@ -1253,14 +1304,14 @@ def _prune_qwen3vl_vision(clip):
     transformer = next(
         (
             module for module in model.modules()
-            if getattr(module, "model_type", None) == "qwen3vl_4b"
+            if getattr(module, "model_type", None) in ("qwen3vl_4b", "qwen3vl_8b")
             and hasattr(module, "visual")
         ),
         None,
     ) if model is not None and hasattr(model, "modules") else None
     if transformer is None:
         raise RuntimeError(
-            "The text-only Qwen3-VL GGUF was not loaded as a Qwen3-VL 4B model; "
+            "The text-only Qwen3-VL GGUF was not loaded as a Qwen3-VL text encoder; "
             "cannot safely disable its vision tower."
         )
     if getattr(transformer, "visual", None) is not None:
@@ -1274,7 +1325,7 @@ def _prune_qwen3vl_vision(clip):
         return None, None
 
     transformer.preprocess_embed = reject_image_embed
-    logging.info("Qwen3-VL 4B Q8_CR: disabled the unused vision tower; image input is rejected.")
+    logging.info("Qwen3-VL text-only Q8_CR: disabled the unused vision tower; image input is rejected.")
 
 
 def _load_dynamic_gguf_clip(
@@ -1303,7 +1354,7 @@ def _load_dynamic_gguf_clip(
             if extra.get("qwen3vl_text_only"):
                 if len(clip_paths) != 1:
                     raise ValueError(
-                        "The text-only Qwen3-VL 4B Q8_CR encoder must be loaded by itself."
+                        "The text-only Qwen3-VL Q8_CR encoder must be loaded by itself."
                     )
                 if "int8_tensorwise" not in extra.get("gguf_quant_formats", ()):
                     raise ValueError(
@@ -1325,7 +1376,7 @@ def _load_dynamic_gguf_clip(
                             "Qwen3-VL text-only GGUF contains no materializable Q8_CR Linear weights."
                         )
                     logging.warning(
-                        "Qwen3-VL 4B Q8_CR: native INT8 was not selected (%s); "
+                        "Qwen3-VL text-only Q8_CR: native INT8 was not selected (%s); "
                         "restored %d ConvRot weight(s) for dequantized higher-precision execution.",
                         qwen3vl_native_reason,
                         restored,
@@ -1333,7 +1384,7 @@ def _load_dynamic_gguf_clip(
                 else:
                     device, capability = qwen3vl_native_device
                     logging.info(
-                        "Qwen3-VL 4B Q8_CR: selecting native TensorWiseINT8 ConvRot on %s "
+                        "Qwen3-VL text-only Q8_CR: selecting native TensorWiseINT8 ConvRot on %s "
                         "(compute capability %d.%d).",
                         device,
                         capability[0],

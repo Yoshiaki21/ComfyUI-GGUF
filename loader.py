@@ -12,12 +12,15 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 from .quant_ops import make_quantized
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
+IMG_ARCH_LIST = {"flux", "flux3", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_image", "minimax_h3_vae", "minimax_music3", "moss_image", "fibo2"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4", "minimax_music3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
 QWEN3VL_TEXT_ONLY_METADATA = "comfy.gguf.qwen3vl.text_only"
 QWEN3VL_VARIANT_METADATA = "comfy.gguf.qwen3vl.variant"
+# Sizes this pack's converter can emit a text-only Q8_CR file for, and that the
+# loader therefore accepts that metadata on.
+QWEN3VL_TEXT_ONLY_VARIANTS = ("4b", "8b")
 GGUF_FLOAT32_TYPE = getattr(
     gguf.GGUFValueType,
     "FLOAT32",
@@ -205,7 +208,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     } | {
         tensor_name
         for key, quant_conf in custom_quant_configs.items()
-        if quant_conf.get("format") == "int4_cr"
+        if quant_conf.get("format") in {"int4_cr", "int1_cr"}
         for tensor_name in (key, f"{key}_scale")
     }
 
@@ -294,6 +297,41 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             quant_conf.get("format") for quant_conf in custom_quant_configs.values()
         ),
     }
+    int4_backings = {
+        quant_conf.get("backing")
+        for quant_conf in custom_quant_configs.values()
+        if quant_conf.get("format") == "int4_cr"
+    }
+    int1_formats = {
+        quant_conf.get("backing")
+        for quant_conf in custom_quant_configs.values()
+        if quant_conf.get("format") == "int1_cr"
+    }
+    if int1_formats and int4_backings:
+        raise ValueError("GGUF mixes incompatible Q1_CR_XL and Q4_CR custom formats.")
+    if len(int1_formats) > 1:
+        raise ValueError(
+            f"GGUF mixes incompatible Q1_CR_XL backings: {sorted(map(str, int1_formats))!r}"
+        )
+    if len(int4_backings) > 1:
+        raise ValueError(
+            f"GGUF mixes incompatible Q4_CR backings: {sorted(map(str, int4_backings))!r}"
+        )
+    if int1_formats == {"w1a16"}:
+        extra["gguf_quant_mode"] = "int1_cr_xl"
+    elif int1_formats:
+        raise ValueError(
+            f"Unsupported Q1_CR_XL backing: {sorted(map(str, int1_formats))!r}"
+        )
+    elif int4_backings == {"w4a4"}:
+        extra["gguf_quant_mode"] = "int4_cr_w4a4"
+    elif int4_backings == {"w4a8"}:
+        extra["gguf_quant_mode"] = "int4_cr_w4a8"
+    elif any(
+        quant_conf.get("format") == "int8_tensorwise"
+        for quant_conf in custom_quant_configs.values()
+    ):
+        extra["gguf_quant_mode"] = "int8_convrot"
 
     # Detect custom ComfyUI native quantization metadata
     warned_unrotated_convrot = False
@@ -332,7 +370,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 quant_conf.pop("convrot_groupsize", None)
             elif quant_conf.get("convrot"):
                 groupsize = quant_conf.get("convrot_groupsize", 256)
-                weight_shape = weight_ggml.shape if dynamic else weight_ggml.tensor_shape
+                weight_shape = getattr(weight_ggml, "tensor_shape", weight_ggml.shape)
                 if weight_shape[-1] % groupsize != 0:
                     logging.warning(
                         "Disabling ConvRot for %s because %d input features are not "
@@ -345,12 +383,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                     quant_conf.pop("convrot_groupsize", None)
 
             # Convert to ComfyUI native state-dict layout
-            if dynamic:
-                weight = weight_ggml.view(torch.int8).reshape(weight_ggml.shape)
-                scale = scale_ggml.view(torch.float32).reshape(scale_ggml.shape)
-            else:
-                weight = weight_ggml.data.view(torch.int8).reshape(weight_ggml.tensor_shape)
-                scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
+            weight_shape = getattr(weight_ggml, "tensor_shape", weight_ggml.shape)
+            scale_shape = getattr(scale_ggml, "tensor_shape", scale_ggml.shape)
+            weight = weight_ggml.data.view(torch.int8).reshape(weight_shape)
+            scale = scale_ggml.data.view(torch.float32).reshape(scale_shape)
 
             state_dict[weight_key] = torch.nn.Parameter(weight, requires_grad=False)
             state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
@@ -361,25 +397,42 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 torch.tensor(list(quant_json.encode("utf-8")), dtype=torch.uint8),
                 requires_grad=False,
             )
-            extra["gguf_quant_mode"] = "int8_convrot"
 
-        # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast ConvRot
-        # int4 tensor-core MMA. On-disk is kitchen-native packed int4 (N, K//2)
-        # int8 + a per-output-row fp16 scale; no per-group scales/zeros.
-        # The weight is pre-rotated by a block-diagonal Hadamard along K, matching
-        # the activation rotation the kernel applies at runtime.
-        elif fmt == "int4_cr" and quant_conf.get("backing") == "w4a4":
+        # Q4_CR_W4A4 and Q4_CR_L share packed ConvRot INT4 storage. The backing
+        # selects INT4 or INT8 activation execution; scales and packed bytes are
+        # unchanged between formats.
+        elif fmt == "int4_cr" and quant_conf.get("backing") in {"w4a4", "w4a8"}:
             orig_shape = torch.Size(tuple(quant_conf["orig_shape"]))
+            backing = quant_conf["backing"]
+            expected_linear_dtype = "int8" if backing == "w4a8" else "int4"
+            if backing == "w4a8" and "linear_dtype" not in quant_conf:
+                raise ValueError(f"Missing Q4_CR_L linear_dtype metadata for {weight_key}")
+            if quant_conf.get("linear_dtype", expected_linear_dtype) != expected_linear_dtype:
+                raise ValueError(
+                    f"Invalid Q4_CR linear_dtype for {weight_key}: backing {backing!r} "
+                    f"requires {expected_linear_dtype!r}."
+                )
+            if len(orig_shape) != 2 or orig_shape[0] <= 0 or orig_shape[1] <= 0 or orig_shape[1] % 2:
+                raise ValueError(f"Invalid Q4_CR original shape for {weight_key}: {tuple(orig_shape)!r}")
             convrot_groupsize = quant_conf.get("convrot_groupsize", 256)
             quant_group_size = quant_conf.get("quant_group_size", 64)
+            if (
+                not isinstance(convrot_groupsize, int)
+                or isinstance(convrot_groupsize, bool)
+                or convrot_groupsize <= 0
+                or not isinstance(quant_group_size, int)
+                or isinstance(quant_group_size, bool)
+                or orig_shape[1] % convrot_groupsize
+                or quant_group_size != 64
+            ):
+                raise ValueError(
+                    f"Invalid Q4_CR shape/group metadata for {weight_key}: shape={tuple(orig_shape)!r}, "
+                    f"convrot_groupsize={convrot_groupsize}, quant_group_size={quant_group_size}."
+                )
             packed_shape = (orig_shape[0], orig_shape[1] // 2)
 
-            if dynamic:
-                packed = weight_ggml.view(torch.int8).reshape(packed_shape)
-                scale = scale_ggml.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
-            else:
-                packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
-                scale = scale_ggml.data.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
+            packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
+            scale = scale_ggml.data.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
 
             layer_prefix = weight_key[:weight_key.rfind("weight")]
 
@@ -389,13 +442,64 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8),
                 requires_grad=False,
             )
-            extra["gguf_quant_mode"] = "int4_cr_w4a4"
 
         elif fmt == "int4_cr":
-            # The retired W4A16 (AWQ GEMV) Q4_CR format is no longer supported.
             raise ValueError(
-                "This Q4_CR GGUF uses the retired W4A16 backing (no 'backing': 'w4a4'). "
-                "Reconvert with --quant-type Q4_CR_W4A4."
+                f"Unsupported Q4_CR backing for {weight_key}: {quant_conf.get('backing')!r}. "
+                "Reconvert with --quant-type Q4_CR_W4A4 or Q4_CR_L."
+            )
+        elif fmt == "int1_cr" and quant_conf.get("backing") == "w1a16":
+            orig_shape = tuple(quant_conf.get("orig_shape", ()))
+            if (
+                len(orig_shape) != 2
+                or not all(isinstance(dim, int) and not isinstance(dim, bool) and dim > 0 for dim in orig_shape)
+            ):
+                raise ValueError(f"Invalid Q1_CR_XL original shape for {weight_key}: {orig_shape!r}")
+            n, k = orig_shape
+            convrot_groupsize = quant_conf.get("convrot_groupsize")
+            quant_group_size = quant_conf.get("quant_group_size")
+            if (
+                quant_conf.get("linear_dtype") != "bf16"
+                or quant_conf.get("weight_rotated") is not True
+                or convrot_groupsize != 256
+                or quant_group_size != 64
+                or k % convrot_groupsize
+                or k % quant_group_size
+            ):
+                raise ValueError(
+                    f"Invalid Q1_CR_XL format metadata for {weight_key}: "
+                    f"linear_dtype={quant_conf.get('linear_dtype')!r}, "
+                    f"convrot_groupsize={convrot_groupsize!r}, "
+                    f"quant_group_size={quant_group_size!r}."
+                )
+            packed_shape = (n, k // 8)
+            scale_shape = (n, k // quant_group_size)
+            packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
+            scale = scale_ggml.data.view(torch.float16).reshape(scale_shape)
+            if tuple(getattr(weight_ggml, "tensor_shape", weight_ggml.shape)) != packed_shape:
+                raise ValueError(
+                    f"Invalid Q1_CR_XL packed tensor for {weight_key}: "
+                    f"expected {packed_shape}, got "
+                    f"{tuple(getattr(weight_ggml, 'tensor_shape', weight_ggml.shape))}."
+                )
+            if tuple(getattr(scale_ggml, "tensor_shape", scale_ggml.shape)) != scale_shape:
+                raise ValueError(
+                    f"Invalid Q1_CR_XL scale tensor for {weight_key}: "
+                    f"expected {scale_shape}, got "
+                    f"{tuple(getattr(scale_ggml, 'tensor_shape', scale_ggml.shape))}."
+                )
+
+            layer_prefix = weight_key[:weight_key.rfind("weight")]
+            state_dict[weight_key] = torch.nn.Parameter(packed, requires_grad=False)
+            state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
+            state_dict[f"{layer_prefix}comfy_quant"] = torch.nn.Parameter(
+                torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8),
+                requires_grad=False,
+            )
+        elif fmt == "int1_cr":
+            raise ValueError(
+                f"Unsupported Q1_CR_XL backing for {weight_key}: {quant_conf.get('backing')!r}. "
+                "Reconvert with --quant-type Q1_CR_XL."
             )
 
     return (state_dict, extra)
@@ -489,6 +593,9 @@ QWEN35_SD_MAP = {
     "output_norm": "model.language_model.norm",
     "output.weight": "lm_head.weight",
 }
+
+# Embedding key of a qwen35 GGUF that already uses ComfyUI key names (no llama.cpp layout).
+QWEN35_COMFY_EMBED_KEY = "model.language_model.embed_tokens.weight"
 
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
@@ -1010,6 +1117,19 @@ def inject_qwen3vl_detection_markers(sd):
         merge_dim,
     )
 
+def dequantize_raw_lm_head(sd):
+    if "lm_head.weight" in sd and is_quantized(sd["lm_head.weight"]):
+        lm_head = sd["lm_head.weight"]
+        if getattr(lm_head, "tensor_type", None) != gguf.GGMLQuantizationType.BF16:
+            # BaseGenerate.logits() feeds lm_head straight to F.linear,
+            # bypassing the GGML ops path that dequantizes on the fly.
+            # Block-quantized GGUF data has a byte-expanded shape (e.g.
+            # Q8_0 stores scales interleaved), so raw data must never
+            # reach the matmul. BF16 storage is already full precision
+            # and keeps its logical shape, so it can stay quantized.
+            logging.warning(f"Dequantizing lm_head.weight to prevent raw-block matmul.")
+            sd["lm_head.weight"] = dequantize_tensor(lm_head, dtype=torch.float16)
+
 def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=False):
     sd, extra = gguf_sd_loader(
         path,
@@ -1021,10 +1141,12 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=F
     metadata = extra.get("metadata", {})
     qwen3vl_text_only = metadata.get(QWEN3VL_TEXT_ONLY_METADATA) is True
     if qwen3vl_text_only and (
-        arch != "qwen3vl" or metadata.get(QWEN3VL_VARIANT_METADATA) != "4b"
+        arch != "qwen3vl"
+        or metadata.get(QWEN3VL_VARIANT_METADATA) not in QWEN3VL_TEXT_ONLY_VARIANTS
     ):
         raise ValueError(
-            "Qwen3-VL text-only metadata is valid only on a Qwen3-VL 4B GGUF."
+            "Qwen3-VL text-only metadata is valid only on a Qwen3-VL "
+            f"{' or '.join(QWEN3VL_TEXT_ONLY_VARIANTS)} GGUF."
         )
     extra["qwen3vl_text_only"] = qwen3vl_text_only
     if arch == "minimax_music3" and "tokenizer_json" in sd:
@@ -1038,6 +1160,20 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=F
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
+    elif arch == "qwen35" and QWEN35_COMFY_EMBED_KEY in sd:
+        # Already converted to ComfyUI key names (e.g. by a script that undoes llama.cpp's
+        # Qwen3.5 changes offline). Applying QWEN35_SD_MAP / qwen35_corrections again would
+        # subtract 1 from norms that are already raw, take log(-x) of a raw A_log and
+        # reorder V heads twice, which renders NaN (black images).
+        if is_quantized(sd[QWEN35_COMFY_EMBED_KEY]):
+            # Same reason as token_embd below: otherwise every forward dequantizes the
+            # 248k-row table to fp32 on the GPU (a ~3.8 GiB spike for the 9B model).
+            logging.warning(f"Dequantizing {QWEN35_COMFY_EMBED_KEY} to prevent runtime OOM.")
+            sd[QWEN35_COMFY_EMBED_KEY] = dequantize_tensor(sd[QWEN35_COMFY_EMBED_KEY], dtype=torch.float16)
+        dequantize_raw_lm_head(sd)
+        if not any(key.startswith(("model.visual.", "visual.")) for key in sd):
+            # No embedded vision tower: use the mmproj sidecar, as the llama.cpp branch does.
+            sd.update(gguf_mmproj_loader(path))
     elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
@@ -1095,17 +1231,7 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=F
             # parameters so that load_state_dict(strict=False) doesn't raise a size
             # mismatch error while still satisfying detect_te_model()'s key checks.
             inject_qwen3vl_detection_markers(sd)
-        if "lm_head.weight" in sd and is_quantized(sd["lm_head.weight"]):
-            lm_head = sd["lm_head.weight"]
-            if getattr(lm_head, "tensor_type", None) != gguf.GGMLQuantizationType.BF16:
-                # BaseGenerate.logits() feeds lm_head straight to F.linear,
-                # bypassing the GGML ops path that dequantizes on the fly.
-                # Block-quantized GGUF data has a byte-expanded shape (e.g.
-                # Q8_0 stores scales interleaved), so raw data must never
-                # reach the matmul. BF16 storage is already full precision
-                # and keeps its logical shape, so it can stay quantized.
-                logging.warning(f"Dequantizing lm_head.weight to prevent raw-block matmul.")
-                sd["lm_head.weight"] = dequantize_tensor(lm_head, dtype=torch.float16)
+        dequantize_raw_lm_head(sd)
     elif arch == "ideogram":
         # Dequantize Ideogram model for inference
         logging.info("Dequantizing Ideogram model for inference...")

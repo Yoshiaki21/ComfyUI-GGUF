@@ -1,7 +1,12 @@
 """Local web dashboard for tools/convert.py.
 
-Run from the repository root with:
+Run from the repository root with the ComfyUI Python environment:
     python tools\\conversion_webui.py
+
+A pythonXX._pth file next to the interpreter (the ComfyUI Windows portable pack
+ships python313._pth) starts CPython in isolated safe-path mode, so the script
+directory is not added to sys.path and PYTHONPATH is ignored; the setup below
+registers tools/ explicitly instead.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ import argparse
 import json
 import os
 import queue
+import shlex
 import subprocess
 import sys
 import threading
@@ -22,10 +28,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    # Interpreters that ship a pythonXX._pth file next to the executable (the
+    # ComfyUI Windows portable pack) start in isolated safe-path mode: sys.path
+    # comes from that file, the script's own folder is never prepended, and
+    # PYTHONPATH is ignored, so the plain "import convert" fallback below would
+    # fail with ModuleNotFoundError. Register tools/ explicitly instead.
+    sys.path.insert(0, str(TOOLS_DIR))
+
 try:
     from .convert import QUANT_TYPE_MAP
 except ImportError:
-    from convert import QUANT_TYPE_MAP
+    from convert import QUANT_TYPE_MAP  # noqa: E402  (tools/convert.py)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -187,6 +202,28 @@ class ConversionManager:
                 raise ValueError("Only queued or running conversions can be cancelled.")
             return self.public(job)
 
+    def retry(self, job_id: str) -> dict[str, Any]:
+        with self.lock:
+            job = self._job(job_id)
+            if job["status"] not in {"failed", "cancelled"}:
+                raise ValueError("Only failed or cancelled conversions can be retried.")
+            destination = Path(job["destination"])
+            if destination.exists():
+                if not destination.is_file():
+                    raise ValueError(f"Cannot retry because the destination is not a file: {destination}")
+                try:
+                    destination.unlink()
+                except OSError as error:
+                    raise ValueError(f"Cannot remove the partial destination before retry: {error}") from error
+            job["status"] = "queued"
+            job["started_at"] = None
+            job["finished_at"] = None
+            job["error"] = None
+            job["return_code"] = None
+            job["log"].append("Retrying conversion.")
+            self.pending.put(job_id)
+            return self.public(job)
+
     def list_jobs(self) -> list[dict[str, Any]]:
         with self.lock:
             return [self.public(job) for job in reversed(list(self.jobs.values()))]
@@ -198,7 +235,11 @@ class ConversionManager:
             raise ValueError("Conversion job was not found.") from error
 
     def public(self, job: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in job.items() if key != "command"}
+        public_job = {key: value for key, value in job.items() if key != "command"}
+        command = job["command"]
+        public_job["command"] = command.copy()
+        public_job["command_line"] = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+        return public_job
 
     def _work(self) -> None:
         while True:
@@ -280,6 +321,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 job_id = path.removeprefix("/api/jobs/").removesuffix("/cancel").strip("/")
                 self._send_json(HTTPStatus.OK, {"job": MANAGER.cancel(job_id)})
+            elif path.startswith("/api/jobs/") and path.endswith("/retry"):
+                job_id = path.removeprefix("/api/jobs/").removesuffix("/retry").strip("/")
+                self._send_json(HTTPStatus.OK, {"job": MANAGER.retry(job_id)})
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
         except ValueError as error:

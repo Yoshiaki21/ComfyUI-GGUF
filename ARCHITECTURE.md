@@ -32,24 +32,86 @@ For Krea 2 and Ideogram 4 models on RTX 30-series architecture, `Q8_CR` offers s
 * High image fidelity expected from 8-bit quantization while shielding sensitive tensors.
 * Reduced VRAM pressure during complex multi-model spatial workflows.
 
-## Native GGML K-Quant Linear Execution
+## ConvRot INT4 Formats (Q4_CR_W4A4 and Q4_CR_L)
 
-Standard `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF bytes and
-can use the optional bundled Triton/CUDA backend for eligible 2-D Linear
-weights. The kernel decodes super-block scales, minima, and packed values while
-accumulating the matrix product, avoiding a full floating-point weight
-allocation on each forward. It supports FP16, BF16, and FP32 activations and
-rank-3 activation shapes after flattening the leading dimensions.
+Both INT4 formats store the same kitchen-native ConvRot payload: packed signed
+INT4 weights shaped `[N, K // 2]` in `I8` GGUF storage, one `F16` scale per
+output row, and `int4_cr` metadata with `convrot_groupsize=256` and
+`quant_group_size=64`. The metadata backing distinguishes the execution mode:
+`w4a4` for `Q4_CR_W4A4`, or `w4a8` plus `linear_dtype="int8"` for `Q4_CR_L`.
+`Q4_CR` remains an alias for `Q4_CR_W4A4`; the W4A8 variant is an explicit
+converter selection and does not change the default.
 
-The backend is loaded lazily so installations without Triton or CUDA continue
-to use the existing PyTorch dequantization path. On ROCm builds of PyTorch
-(which also report the `cuda` device type) the bundled Triton kernel is
-disabled by default because it was measured much slower than dequantize plus
-rocBLAS for diffusion workloads; set `COMFYUI_GGUF_KQUANT_TRITON_ROCM=1` to opt
-in. Non-Linear operations,
-unsupported block alignment, active weight patches/LoRAs, and backend failures
-also use the reference path. `Q2_K`, `Q3_K`, `Q8_K`, IQ formats, and custom CR
-formats are intentionally outside this route.
+`Q4_CR_L` builds the same `TensorCoreConvRotW4A4Layout` with
+`linear_dtype="int8"`. On the supported CUDA backend this quantizes rotated
+activations row-wise to INT8 and executes INT4-weight × INT8-activation GEMV
+for small row counts or chunked INT8 GEMM for larger batches. This is a
+`comfy_kitchen` CUDA route; there is no ComfyUI-GGUF Triton kernel for this
+row-wise layout. The separate grouped-codebook `AsymW4A8Int8Layout` Triton
+kernel uses different weight storage and is not used by `Q4_CR_L`. The
+`comfy_kitchen` eager ConvRot implementation currently quantizes activations to
+INT4 even when given the `int8` selector, so non-CUDA execution deliberately
+uses dense dequantized PyTorch weights instead of silently running W4A4.
+
+The custom GGUF loader validates the backing/linear-dtype metadata and selects
+a corresponding operator mode. Mixed `Q8_CR` layers in a Q4 file are
+materialized safely by the Q4 operator, and loader mode selection prioritizes
+the Q4 backing when both custom formats are present. Unsupported or malformed
+backings are rejected rather than interpreted as another format.
+
+## Experimental Q1_CR_XL (W1A16)
+
+`Q1_CR_XL` stores a 2D Linear matrix as little-endian packed sign bits
+`[N, K // 8]` in GGUF `I8`, plus FP16 binary scales `[N, K // 64]`. Before
+packing, each 256-column block is multiplied by the regular normalized
+Hadamard matrix; each 64-weight group's scale is the mean absolute rotated
+weight, the least-squares optimal scale for fixed `{-1, +1}` values. The
+format metadata records the original dimensions, `backing="w1a16"`, and
+`linear_dtype="bf16"`.
+
+The experimental runtime rotates activations online, uses a Triton kernel to
+decode the sign bits and group scales into a temporary BF16 weight matrix, then
+calls PyTorch/cuBLAS Linear. This is not native binary TensorCore inference:
+the temporary dense matrix raises peak memory during a layer call and the
+prototype fused Triton GEMM was not fast enough to enable by default. Standard
+LoRA/LoKr patches use a low-rank output correction; unsupported patch types use
+the existing fused dense-weight fallback. Qwen Image 2.1 keeps conditioning,
+normalization, input/output, and attention weights at higher precision
+(attention uses `Q8_CR`) and applies `Q1_CR_XL` to eligible image MLP matrices.
+This format is experimental; validate output quality, peak VRAM, and latency
+on the target GPU before using it for production conversions.
+
+## Experimental Accelerated GGML K-Quant Linear
+
+Standard `Q3_K`, `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF
+bytes and eligible 2-D Linear operations use the experimental bundled
+Triton/CUDA backend by default. Triton decodes packed values into a
+floating-point weight, then calls the same `torch.nn.functional.linear()` as
+the portable path. Intermediate rounding follows the loader's decode
+precision, not necessarily the activation dtype: the default and Dynamic VRAM
+paths decode in FP16 before casting, while explicit BF16, FP16, FP32, and
+`target` settings retain their existing semantics. The backend is enabled when
+`COMFYUI_GGUF_KQUANT_BACKEND` is unset or empty; set it to `none`, `off`,
+`disabled`, or `false` before starting ComfyUI to opt out. A custom module name
+selects an alternate backend.
+
+The benchmarked selection uses FP16 or BF16 activations on CUDA SM 8.6.
+Q3_K dispatch supports 2-D Linear weights and up to 8192 activation rows;
+Q5_K/Q6_K dispatch remains restricted to the measured LTX shapes and at most
+1024 rows. Q4_K is decoder-tested but not routed in production. Unsupported
+devices, activation dtypes, shapes, operations, active weight patches/LoRAs,
+and backend failures use portable dequantization. The Krea-2 Q3_K benchmark
+showed lower latency on this RTX 3080 Laptop, but does not establish universal
+performance or correctness on the reporter's RTX 5090. `Q2_K`, `Q8_K`, IQ
+formats, and custom CR formats remain outside this route.
+
+On ROCm builds of PyTorch (which also report the `cuda` device type) the
+bundled Triton kernel additionally declines every route unless
+`COMFYUI_GGUF_KQUANT_TRITON_ROCM=1` is set. An earlier fused-matmul version of
+this kernel was measured much slower than dequantize plus rocBLAS for diffusion
+workloads on gfx1151. With the current SM 8.6-only launch selection the kernel
+does not run on AMD GPUs even with the opt-in; the gate remains as a safeguard
+if the selection is widened.
 
 ### K-Quant Creation
 
@@ -86,9 +148,13 @@ The fallback logic operates as follows:
 
 Imported GGUF LoRAs retain normal dynamic-patch behavior to ensure maximum compatibility. Because of this, an active LoRA prevents `Q8_CR` Linear layers from utilizing their native INT8 fast path. 
 
-For `Q4_CR_W4A4`, compatible standard LoRA and LoKr patches keep the packed
-INT4 base and add an exact BF16 low-rank output correction on every platform.
-They do not fuse or cache a full patched weight.
+For `Q4_CR_W4A4` and `Q4_CR_L`, compatible standard LoRA and LoKr patches keep
+the packed INT4 base and add a low-rank output correction in the active compute
+dtype. They do not fuse or cache a full patched weight. The static model patcher
+installs patch functions on the quantized Linear rather than applying
+`calculate_weight()` to packed nibble bytes; the Dynamic VRAM patcher promotes
+its `LowVramPatch`, prepares eligible adapter factors, and uses the same native
+bypass. This preserves LoRA execution without corrupting packed weights.
 
 Other patch forms that cannot use either compatible LoRA/LoKr route fall back to a compute-dtype cache:
 1. It dequantizes the target and applies the patch in the compute dtype.
